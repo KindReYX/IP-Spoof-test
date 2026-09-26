@@ -1050,16 +1050,6 @@ IP-Spoof-test/
 
 # License
 
-قبل از Public کردن Repository بهتر است یک License مشخص انتخاب کنید.
-
-برای پروژه‌های Open Source معمولاً یکی از این موارد استفاده می‌شود:
-
-- MIT
-- Apache-2.0
-- GPL-3.0
-
-اگر License انتخاب نشده، بهتر است فایل `LICENSE` به Repository اضافه شود.
-
 ---
 
 ## Disclaimer
