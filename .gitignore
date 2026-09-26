@@ -1,0 +1,29 @@
+# Runtime results
+spoof_summary.csv
+spoof_full.csv
+*.log
+
+# Debug / capture artifacts
+logs/
+debug/
+*.pcap
+*.pcapng
+
+# Private target lists / local environment
+*private*.txt
+targets-private.txt
+.env
+.env.*
+
+# Credentials / keys
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~

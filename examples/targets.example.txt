@@ -1,0 +1,7 @@
+# Documentation-only example targets.
+# Replace these with IPs/CIDRs you own or are explicitly authorized to test.
+
+192.0.2.10
+192.0.2.20
+198.51.100.0/29
+203.0.113.0/29

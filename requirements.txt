@@ -1,0 +1,134 @@
+# IP-Spoof-test - Manual system requirements
+# Repository: KindReYX/IP-Spoof-test
+#
+# This is NOT a pip-only requirements file.
+# The project depends primarily on Linux system networking tools.
+# Use ONE section below for your distribution.
+# Run installation commands as root or with sudo.
+
+============================================================
+Debian / Ubuntu
+============================================================
+
+sudo apt update
+sudo apt install -y \
+  bash \
+  coreutils \
+  curl \
+  iproute2 \
+  iptables \
+  nftables \
+  iputils-ping \
+  tcpdump \
+  conntrack \
+  nmap \
+  openssh-client \
+  sshpass \
+  python3 \
+  python3-pip \
+  python3-scapy \
+  screen
+
+============================================================
+Fedora / Rocky Linux / AlmaLinux / RHEL-compatible
+============================================================
+
+sudo dnf install -y \
+  bash \
+  coreutils \
+  curl \
+  iproute \
+  iptables \
+  nftables \
+  iputils \
+  tcpdump \
+  conntrack-tools \
+  nmap \
+  openssh-clients \
+  sshpass \
+  python3 \
+  python3-pip \
+  screen
+
+# If dnf is unavailable but yum exists:
+# sudo yum install -y bash coreutils curl iproute iptables nftables iputils tcpdump conntrack-tools nmap openssh-clients sshpass python3 python3-pip screen
+
+# Scapy package availability varies by distribution/version.
+# Prefer the distro package if available. Otherwise use a Python virtual environment.
+
+============================================================
+Arch Linux
+============================================================
+
+sudo pacman -S --needed \
+  bash \
+  coreutils \
+  curl \
+  iproute2 \
+  iptables \
+  nftables \
+  iputils \
+  tcpdump \
+  conntrack-tools \
+  nmap \
+  openssh \
+  sshpass \
+  python \
+  python-pip \
+  python-scapy \
+  screen
+
+============================================================
+Alpine Linux
+============================================================
+
+sudo apk add \
+  bash \
+  coreutils \
+  curl \
+  iproute2 \
+  iptables \
+  nftables \
+  iputils \
+  tcpdump \
+  conntrack-tools \
+  nmap \
+  openssh-client \
+  sshpass \
+  python3 \
+  py3-pip \
+  py3-scapy \
+  screen
+
+============================================================
+Verify required commands
+============================================================
+
+command -v bash
+command -v ip
+command -v iptables
+command -v nft
+command -v ping
+command -v tcpdump
+command -v conntrack
+command -v nping
+command -v ssh
+command -v sshpass
+command -v curl
+command -v python3
+command -v timeout
+
+python3 -c 'import scapy; print("Scapy OK")'
+
+============================================================
+Run the project
+============================================================
+
+chmod +x IP_Spoofing_test.sh
+sudo ./IP_Spoofing_test.sh
+
+# For long IP/CIDR lists, run inside screen:
+# screen -S ip-spoof-test
+# sudo ./IP_Spoofing_test.sh
+# Detach: Ctrl+A, then D
+# Reattach: screen -r ip-spoof-test
