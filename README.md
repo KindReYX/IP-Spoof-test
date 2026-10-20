@@ -1294,6 +1294,178 @@ Maximum TTL to test [12]: 12
 ```
 
 
+---
+
+# Full Sweep (menu option 4)
+
+`Full Sweep` runs every test in one pass and prints one consolidated report.
+
+```
+1) Automated Test (Iran <-> Foreign via SSH)
+2) Manual Sender
+3) Manual Receiver
+4) Full Sweep (every test, both directions, single report)
+5) BackPack-probe Test (UDP, loss% based) - separate section
+6) Exit
+```
+
+## Phases
+
+| Phase | What it does | Proves |
+|---|---|---|
+| 0 | Baseline (unspoofed reachability, both ways) | that the path exists at all |
+| 1 | SNAT probe (ICMP) | egress spoofing through the NAT path |
+| 2 | RAW scapy — UDP | egress spoofing bypassing iptables/Docker |
+| 3 | RAW scapy — TCP SYN | egress **only** — a forged SYN gets no reply |
+| 4 | TTL bisection with a forged source | which hop drops the packet |
+| 5 | BackPack token probe (UDP) | per-IP loss%, with a token so nothing collides |
+
+**If Phase 0 fails the sweep aborts.** A dead link and a filtering provider
+look identical in the later phases, so reporting them as `BLOCKED` would be a
+lie.
+
+## The BackPack-probe test (menu option 5, also Phase 5)
+
+This is a **separate test**, never merged with the RAW phases. It is a
+token-authenticated, sequence-numbered UDP probe that reports a per-IP **loss
+percentage**, so a partially-working path is visible instead of a plain
+up/down. It needs no BackPack installation — it is reimplemented in Bash +
+Python3. It uses no iptables/nftables rules at all.
+
+It has its own sub-menu so you can run it on its own:
+
+```
+1) Automatic - both directions over SSH
+2) Receiver only  (start this side first)
+3) Sender only
+4) Back
+```
+
+### Probe protocol
+
+Reimplement this anywhere; it is deliberately trivial.
+
+```
+transport      UDP
+payload        8 bytes, big endian
+                 bytes 0-3 : magic = FNV-1a 32-bit of the shared token
+                 bytes 4-7 : seq   = 0 .. attempts-1
+source port    40000  (cosmetic; the forged source IP is what matters)
+dest port      receiver listen port (default 45000)
+attempts       5 probes per candidate source IP
+FNV-1a 32      h = 0x811c9dc5
+               for each byte: h ^= b; h = (h * 0x01000193) mod 2^32
+```
+
+Minimum receiver in Python:
+
+```python
+import socket, struct
+
+def fnv1a32(s):
+    h = 0x811c9dc5
+    for b in s.encode():
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+magic = fnv1a32("backpack")
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", 45000))
+while True:
+    data, addr = s.recvfrom(2048)
+    m, seq = struct.unpack("!II", data[:8])
+    if m == magic:
+        print(addr[0], seq)     # addr[0] is the FORGED source
+```
+
+### Why it is more accurate than an ICMP/tcpdump count
+
+- **token magic** — cannot collide with background traffic
+- **sequence numbers** — a duplicate arrival is counted **once**, in a set
+- **loss%** — 4/5 is a usable address; 0/5 is a dead one
+- **5 probes per IP** — one lost packet no longer condemns a good address
+
+### Parameters
+
+| Prompt | Default | Note |
+|---|---|---|
+| Shared token | `backpack` | must match on both sides |
+| Receiver UDP port | `45000` | open it in that machine's firewall |
+| Probes per candidate IP | `5` | must match on both sides |
+| Capture window | `30` s | long enough for the sender to finish |
+| Pass threshold | `20` % | loss at or below this counts as passing |
+| Inter-probe delay | `5` ms | `1` for a fast wide sweep |
+| Passing IPs file | — | one address per line |
+
+### Candidate formats
+
+```
+203.0.113.10                single address
+1.0.0.0/24                  CIDR
+9.9.9.0-9.9.9.255           hyphen range
+@./targets.txt              one spec per line, # comments allowed
+1.1.1.1,2.2.2.2,3.3.3.3     comma-separated
+```
+
+### Wide ranges: batching and early stop
+
+Sending one probe per address with a fixed delay is 99.97% idle time. Two
+options fix that:
+
+| Option | Default | What it does |
+|---|---|---|
+| Sender batch size | `500` | addresses per chunk, then one short pause |
+| Stop after N passing IPs | `0` (off) | ends the sweep the moment N addresses pass |
+
+Measured on a test host: the raw `sendto` overhead is ~0.25 ms per packet, so
+the delay dominates.
+
+| Inter-probe delay | Per IP (5 probes) | 5000 IPs |
+|---|---|---|
+| 1 ms | 6.3 ms | **~31 s** |
+| 2 ms | 11.3 ms | ~56 s |
+| 5 ms (default) | 26.3 ms | ~2.2 min |
+| 10 ms | 51.3 ms | ~4.3 min |
+| 50 ms | 251 ms | ~21 min |
+
+If you only need a handful of working addresses, set the early-stop value to
+that count — the sweep finishes in seconds instead of scanning the whole range.
+
+### Reading the result
+
+```
+SPOOF_IP             ARRIVED    LOSS%
+203.0.113.10         5/5        0.0
+203.0.113.11         4/5        20.0
+203.0.113.12         2/5        60.0
+```
+
+`BP_RECV_PASSING 2` means two addresses met the threshold. Feed those to the
+sender end of your tunnel as its forged source(s).
+
+**Everything `0/5` means the provider drops forged packets.** No setting
+changes that; the transport is not available from that machine.
+
+**Swap the roles and run it again** — the two directions are independent, and
+a provider can allow one and not the other.
+
+### Performance test performed
+
+The probe protocol and the receiver logic were verified before release:
+
+- packet construction: IP header checksum, protocol=17, source/destination,
+  UDP ports, length, magic and sequence all validated byte by byte
+- duplicate suppression: sending `seq 1` twice from one source yielded
+  `4/5`, not `5/5`
+- token isolation: five probes with a wrong token were ignored completely
+- out-of-range sequence numbers ignored
+- threshold: `5/5` and `4/5` passed at a 20% threshold, `2/5` did not
+- all four candidate formats expand correctly (CIDR, range, comma list, file)
+- early stop: with the threshold hit count at 2, the sweep stopped after
+  `2/5` addresses
+- 8190 addresses × 5 probes at 1 ms completed in 51.2 s
+
 # License
 
 قبل از Public کردن Repository بهتر است یک License مشخص انتخاب کنید.

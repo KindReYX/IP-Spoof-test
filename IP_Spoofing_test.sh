@@ -2763,6 +2763,1100 @@ receiver() {
         "icmp and ($_exp_filter or src host $REAL_SENDER)"
 }
 
+
+# ==========================================================================
+#  BACKPACK-STYLE TOKEN PROBE TEST  (UDP, loss% based)
+# ==========================================================================
+#  Reimplemented (Bash + Python3, no Go, no BackPack install required) from
+#  AminMGMT/BackPack internal/spooftest. It is a SEPARATE test: it never
+#  merges its numbers with the ICMP/UDP/TCP raw-probe phases, because it
+#  measures something different.
+#
+#  PROBE PROTOCOL  (log this, so a receiver can be rewritten anywhere)
+#  --------------------------------------------------------------------
+#    transport      UDP
+#    payload        8 bytes, big endian
+#                     bytes 0-3 : magic = FNV-1a 32-bit of the shared token
+#                     bytes 4-7 : seq   = 0 .. attempts-1
+#    source port    40000 (cosmetic; the forged source IP is what matters)
+#    dest port      receiver listen port (default 45000)
+#    attempts       5 probes per candidate source IP
+#    FNV-1a 32      h = 0x811c9dc5; for each byte: h ^= b; h *= 0x01000193
+#                   (mod 2^32)
+#
+#  WHY IT IS MORE ACCURATE THAN A RAW ICMP/TCPDUMP COUNT
+#  --------------------------------------------------------------------
+#   * token magic  -> cannot collide with background traffic
+#   * seq numbers  -> a duplicate arrival is counted ONCE (set of seqs)
+#   * loss%        -> a partially-working path is visible, not just up/down
+#   * 5 probes/IP  -> one lost packet no longer condemns a good address
+#
+#  The receiver only needs an ordinary UDP socket: an arriving packet
+#  carries the forged source address in its header, so recvfrom() sees it.
+#  No iptables/nftables rules are used anywhere in this test.
+#
+#  TIMING (measured): raw sendto overhead is ~13us/pkt, so the inter-probe
+#  delay dominates. 5 probes/IP at 5ms  => ~25ms/IP => 5000 IPs ~= 2 min.
+#  At 1ms => ~5ms/IP => 5000 IPs ~= 30s. Set BP_DELAY_MS=1 for a 5000-IP
+#  sweep; keep 5ms when you want to stay gentle.
+# ==========================================================================
+
+BP_TOKEN="backpack"
+BP_PORT="45000"
+BP_ATTEMPTS="5"
+BP_WINDOW="30"
+BP_MAX_LOSS="20"
+BP_DELAY_MS="5"
+BP_CHUNK="500"
+BP_CHUNK_SLEEP_MS="100"
+BP_TARGET_HITS="0"
+BP_PASS_FILE=""
+BP_SPEC=""
+BP_DIR_A_RESULT="NOT_RUN"
+BP_DIR_B_RESULT="NOT_RUN"
+BP_IPLIST="/tmp/bp_ips_$$.txt"
+BP_PASSFILE_LOCAL="/tmp/bp_pass_$$.txt"
+
+# ---- Python: receiver ------------------------------------------------------
+bp_receiver_src() {
+cat <<'BP_RECV_PY'
+import sys, socket, struct, time
+
+token    = sys.argv[1]
+port     = int(sys.argv[2])
+attempts = int(sys.argv[3])
+window   = float(sys.argv[4])
+maxloss  = float(sys.argv[5])
+passfile = sys.argv[6] if len(sys.argv) > 6 else ""
+
+
+def fnv1a32(s):
+    h = 0x811c9dc5
+    for b in s.encode():
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def ipkey(ip):
+    try:
+        return tuple(int(x) for x in ip.split("."))
+    except Exception:
+        return (999, 999, 999, 999)
+
+
+magic = fnv1a32(token)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    s.bind(("0.0.0.0", port))
+except OSError as e:
+    print("BP_RECV_BIND_FAIL %s" % e)
+    sys.exit(1)
+
+print("BP_RECV_READY port=%d magic=0x%08x attempts=%d window=%.0fs maxloss=%.1f%%"
+      % (port, magic, attempts, window, maxloss))
+sys.stdout.flush()
+
+seen = {}
+written = set()
+need = attempts - int(attempts * maxloss / 100.0)
+if need < 1:
+    need = 1
+
+deadline = time.time() + window
+s.settimeout(0.5)
+while time.time() < deadline:
+    try:
+        data, addr = s.recvfrom(2048)
+    except socket.timeout:
+        continue
+    except (KeyboardInterrupt, OSError):
+        break
+    if len(data) < 8:
+        continue
+    try:
+        m, seq = struct.unpack("!II", data[:8])
+    except struct.error:
+        continue
+    if m != magic or seq >= attempts:
+        continue
+    src = addr[0]
+    if src not in seen:
+        seen[src] = set()
+    if seq in seen[src]:
+        continue
+    seen[src].add(seq)
+    # live pass-file: an address is written the moment it reaches the
+    # threshold, so a sender-side --target-hits can short-circuit.
+    if passfile and src not in written and len(seen[src]) >= need:
+        written.add(src)
+        try:
+            with open(passfile, "a") as f:
+                f.write(src + "\n")
+                f.flush()
+        except OSError:
+            pass
+
+rows = []
+for ip, seqs in seen.items():
+    arrived = len(seqs)
+    loss = (attempts - arrived) * 100.0 / attempts
+    rows.append((loss, ipkey(ip), ip, arrived))
+
+rows.sort()
+
+passing = [r for r in rows if r[0] <= maxloss]
+
+print("")
+print("BP_RECV_TABLE_BEGIN")
+print("%-20s %-10s %s" % ("SPOOF_IP", "ARRIVED", "LOSS%"))
+for loss, _k, ip, arrived in rows:
+    print("%-20s %-10s %.1f" % (ip, "%d/%d" % (arrived, attempts), loss))
+print("BP_RECV_TABLE_END")
+print("BP_RECV_PASSING %d" % len(passing))
+for loss, _k, ip, arrived in passing:
+    print("BP_PASS %s %.1f" % (ip, loss))
+
+if not rows:
+    print("BP_RECV_NOTE no probes arrived at all - provider drops forged packets")
+BP_RECV_PY
+}
+
+# ---- Python: sender --------------------------------------------------------
+bp_sender_src() {
+cat <<'BP_SEND_PY'
+import sys, socket, struct, time, ipaddress
+
+target   = sys.argv[1]
+dport    = int(sys.argv[2])
+attempts = int(sys.argv[3])
+delay    = float(sys.argv[4]) / 1000.0
+token    = sys.argv[5]
+iface    = sys.argv[6]
+cands    = sys.argv[7:]
+
+SRC_PORT = 40000
+
+
+def fnv1a32(s):
+    h = 0x811c9dc5
+    for b in s.encode():
+        h ^= b
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def csum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    total = 0
+    for i in range(0, len(data), 2):
+        total += (data[i] << 8) + data[i + 1]
+    total = (total >> 16) + (total & 0xFFFF)
+    total += (total >> 16)
+    return (~total) & 0xFFFF
+
+
+def build(src, dst, payload):
+    ulen = 8 + len(payload)
+    pseudo = socket.inet_aton(src) + socket.inet_aton(dst) + struct.pack("!BBH", 0, 17, ulen)
+    uh = struct.pack("!HHHH", SRC_PORT, dport, ulen, 0)
+    c = csum(pseudo + uh + payload) or 0xFFFF
+    udp = struct.pack("!HHHH", SRC_PORT, dport, ulen, c) + payload
+    total = 20 + len(udp)
+
+    def iph(chk):
+        return struct.pack("!BBHHHBBH4s4s", 0x45, 0, total, 0, 0, 64, 17, chk,
+                           socket.inet_aton(src), socket.inet_aton(dst))
+
+    return iph(csum(iph(0))) + udp
+
+
+def expand(spec):
+    spec = spec.strip()
+    if not spec:
+        return
+    if spec.startswith("@"):
+        try:
+            with open(spec[1:]) as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].strip()
+                    if line:
+                        for ip in expand(line):
+                            yield ip
+        except OSError as e:
+            print("BP_SEND_READ_FAIL %s" % e)
+        return
+    if "/" in spec:
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            print("BP_SEND_BAD_SPEC %s" % spec)
+            return
+        src_iter = net.hosts() if net.num_addresses > 2 else iter([net.network_address])
+        for ip in src_iter:
+            yield str(ip)
+        return
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        try:
+            start = int(ipaddress.ip_address(a.strip()))
+            end = int(ipaddress.ip_address(b.strip()))
+        except ValueError:
+            print("BP_SEND_BAD_SPEC %s" % spec)
+            return
+        if end < start:
+            start, end = end, start
+        if end - start > 65535:
+            end = start + 65535
+        for i in range(start, end + 1):
+            yield str(ipaddress.ip_address(i))
+        return
+    try:
+        ipaddress.ip_address(spec)
+    except ValueError:
+        print("BP_SEND_BAD_SPEC %s" % spec)
+        return
+    yield spec
+
+
+magic = fnv1a32(token)
+payloads = [struct.pack("!II", magic, seq) for seq in range(attempts)]
+
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+except PermissionError:
+    print("BP_SEND_NEED_ROOT raw socket requires root")
+    sys.exit(1)
+s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+if iface:
+    try:
+        s.setsockopt(socket.SOL_SOCKET, 25, iface.encode())   # SO_BINDTODEVICE
+    except OSError as e:
+        print("BP_SEND_IFACE_WARN %s" % e)
+
+sent_ips = 0
+sent_pkts = 0
+errors = 0
+t0 = time.time()
+try:
+    for spec in cands:
+        for src in expand(spec):
+            try:
+                for pl in payloads:
+                    s.sendto(build(src, target, pl), (target, 0))
+                    sent_pkts += 1
+                    if delay > 0:
+                        time.sleep(delay)
+            except OSError as e:
+                errors += 1
+                if errors <= 3:
+                    print("BP_SEND_ERR %s -> %s" % (src, e))
+                continue
+            sent_ips += 1
+            if sent_ips % 2000 == 0:
+                print("BP_SEND_PROGRESS %d ips %d pkts %.0fs" % (sent_ips, sent_pkts, time.time() - t0))
+                sys.stdout.flush()
+finally:
+    s.close()
+
+print("BP_SEND_DONE ips=%d pkts=%d errors=%d elapsed=%.1fs"
+      % (sent_ips, sent_pkts, errors, time.time() - t0))
+BP_SEND_PY
+}
+
+# ---- helpers ---------------------------------------------------------------
+
+# Expand one or more specs (ip / cidr / a-b range / comma list) into $1.
+# Echoes the number of addresses written.
+bp_expand_specs() {
+    local out="$1"
+    shift
+    python3 -u - "$out" "$@" <<'BP_EXPAND_PY'
+import sys, ipaddress
+out = sys.argv[1]
+specs = sys.argv[2:]
+n = 0
+
+
+def one(spec):
+    spec = spec.strip()
+    if not spec:
+        return
+    if spec.startswith("@"):
+        try:
+            with open(spec[1:]) as fh:
+                for line in fh:
+                    line = line.split("#", 1)[0].strip()
+                    if line:
+                        for ip in one(line):
+                            yield ip
+        except OSError:
+            print("BAD_SPEC %s" % spec, file=sys.stderr)
+        return
+    if "/" in spec:
+        try:
+            net = ipaddress.ip_network(spec, strict=False)
+        except ValueError:
+            print("BAD_SPEC %s" % spec, file=sys.stderr)
+            return
+        src_iter = net.hosts() if net.num_addresses > 2 else iter([net.network_address])
+        for ip in src_iter:
+            yield str(ip)
+        return
+    if "-" in spec:
+        a, b = spec.split("-", 1)
+        try:
+            start = int(ipaddress.ip_address(a.strip()))
+            end = int(ipaddress.ip_address(b.strip()))
+        except ValueError:
+            print("BAD_SPEC %s" % spec, file=sys.stderr)
+            return
+        if end < start:
+            start, end = end, start
+        if end - start > 65535:
+            end = start + 65535
+        for i in range(start, end + 1):
+            yield str(ipaddress.ip_address(i))
+        return
+    try:
+        ipaddress.ip_address(spec)
+    except ValueError:
+        print("BAD_SPEC %s" % spec, file=sys.stderr)
+        return
+    yield spec
+
+
+with open(out, "w") as f:
+    for spec in specs:
+        for part in spec.split(","):
+            for ip in one(part):
+                f.write(ip + "\n")
+                n += 1
+print(n)
+BP_EXPAND_PY
+}
+
+# Count passing IPs recorded so far, locally or on the Foreign server.
+bp_passing_count() {
+    local where="${1:-local}"
+    if [ "$where" = "remote" ]; then
+        ssh_exec "wc -l < '$BP_PASS_FILE' 2>/dev/null || echo 0" 2>/dev/null | tr -dc '0-9'
+    else
+        if [ -f "$BP_PASSFILE_LOCAL" ]; then
+            wc -l < "$BP_PASSFILE_LOCAL" 2>/dev/null | tr -dc '0-9'
+        else
+            echo 0
+        fi
+    fi
+}
+
+# Send the expanded list in chunks of BP_CHUNK lines.
+#   $1 target  $2 port  $3 attempts  $4 delay_ms  $5 token  $6 iface
+#   $7 ipfile  $8 mode: "local" (this machine sends) | "remote" (Foreign sends)
+#   $9 where-to-poll-for-passes: "local" | "remote"
+bp_send_chunked() {
+    local target="$1" port="$2" attempts="$3" delay="$4" token="$5"
+    local iface="$6" ipfile="$7" mode="$8" poll="${9:-local}"
+    local total done_n
+    total="$(wc -l < "$ipfile" 2>/dev/null | tr -dc '0-9')"
+    total="${total:-0}"
+    if [ "$total" -eq 0 ]; then
+        echo -e "${YELLOW}[!] No candidate addresses to send.${NC}"
+        return 1
+    fi
+
+    if [ "$mode" = "remote" ]; then
+        local rp
+        rp="$(remote_prefix_cmd)"
+        # Hand the whole candidate list over once; we then send it in batches.
+        if ! ssh_exec "cat > /tmp/bp_ips.txt" < "$ipfile"; then
+            echo -e "${RED}[!] Could not upload candidate list to the Foreign server.${NC}"
+            return 1
+        fi
+    fi
+
+    done_n=0
+    exec 9< "$ipfile"
+    while true; do
+        local chunk=()
+        mapfile -t -n "$BP_CHUNK" -u 9 chunk
+        [ "${#chunk[@]}" -eq 0 ] && break
+
+        if [ "$mode" = "local" ]; then
+            bp_sender_src | python3 -u - "$target" "$port" "$attempts" "$delay" "$token" "$iface" "${chunk[@]}" 2>&1 | tail -2
+        else
+            ssh_exec "${rp}python3 -u /tmp/bp_sender_probe.py '$target' '$port' '$attempts' '$delay' '$token' '$iface' ${chunk[*]}" 2>&1 | tail -2
+        fi
+
+        done_n=$((done_n + ${#chunk[@]}))
+        echo -e "${BLUE}    [$done_n/$total IPs probed]${NC}"
+
+        if [ "$BP_TARGET_HITS" -gt 0 ]; then
+            local n
+            n="$(bp_passing_count "$poll")"
+            n="${n:-0}"
+            if [ "$n" -ge "$BP_TARGET_HITS" ]; then
+                echo -e "${GREEN}[+] target-hits reached ($n >= $BP_TARGET_HITS); stopping early.${NC}"
+                break
+            fi
+        fi
+        sleep "$(awk "BEGIN{print $BP_CHUNK_SLEEP_MS/1000}")"
+    done
+    exec 9<&-
+    echo -e "${GREEN}[+] Sent probes for $done_n/$total candidate address(es).${NC}"
+}
+
+bp_prompt_params() {
+    echo
+    echo "--------------------------------------------------"
+    echo " BackPack-style probe parameters"
+    echo "--------------------------------------------------"
+    read -rp "Shared token [${BP_TOKEN}]: " _bp
+    BP_TOKEN="${_bp:-$BP_TOKEN}"
+
+    read -rp "Receiver UDP listen port [${BP_PORT}]: " _bp
+    _bp="${_bp:-$BP_PORT}"
+    [[ "$_bp" =~ ^[0-9]+$ ]] && [ "$_bp" -ge 1 ] && [ "$_bp" -le 65535 ] && BP_PORT="$_bp"
+
+    read -rp "Probes per candidate IP (must match on both sides) [${BP_ATTEMPTS}]: " _bp
+    _bp="${_bp:-$BP_ATTEMPTS}"
+    [[ "$_bp" =~ ^[0-9]+$ ]] && [ "$_bp" -ge 2 ] && [ "$_bp" -le 50 ] && BP_ATTEMPTS="$_bp"
+
+    read -rp "Capture window, seconds [${BP_WINDOW}]: " _bp
+    _bp="${_bp:-$BP_WINDOW}"
+    [[ "$_bp" =~ ^[0-9]+$ ]] && [ "$_bp" -ge 5 ] && [ "$_bp" -le 3600 ] && BP_WINDOW="$_bp"
+
+    read -rp "Report IPs with loss%% at or below [${BP_MAX_LOSS}]: " _bp
+    _bp="${_bp:-$BP_MAX_LOSS}"
+    [[ "$_bp" =~ ^[0-9]+$ ]] && [ "$_bp" -ge 0 ] && [ "$_bp" -le 100 ] && BP_MAX_LOSS="$_bp"
+
+    read -rp "Inter-probe delay in ms (1 = fast sweep) [${BP_DELAY_MS}]: " _bp
+    _bp="${_bp:-$BP_DELAY_MS}"
+    [[ "$_bp" =~ ^[0-9]+$ ]] && BP_DELAY_MS="$_bp"
+}
+
+bp_prompt_confirm() {
+    echo
+    echo "  Token            : $BP_TOKEN"
+    echo "  Listen port      : $BP_PORT"
+    echo "  Probes per IP    : $BP_ATTEMPTS"
+    echo "  Capture window   : ${BP_WINDOW}s"
+    echo "  Pass threshold   : loss <= ${BP_MAX_LOSS}%"
+    echo "  Inter-probe delay: ${BP_DELAY_MS}ms"
+    [ -n "$BP_PASS_FILE" ] && echo "  Passing IPs file : $BP_PASS_FILE"
+    echo
+    read -rp "Start? [y/N]: " _c
+    case "$_c" in
+        y|Y|yes|YES) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---- standalone receiver ---------------------------------------------------
+bp_probe_receiver() {
+    echo
+    echo "======================================================"
+    echo "   BACKPACK PROBE - RECEIVER"
+    echo "======================================================"
+    echo "Start this side FIRST, then start the sender."
+    echo "Uses an ordinary UDP socket: no root, no iptables rules."
+    echo
+    bp_prompt_params
+    read -rp "Write passing IPs to file (empty = none) [$BP_PASS_FILE]: " _pf
+    BP_PASS_FILE="${_pf:-$BP_PASS_FILE}"
+    bp_prompt_confirm || { echo "Cancelled."; return 0; }
+
+    echo
+    echo -e "${BLUE}[*] Listening on udp/${BP_PORT} for ${BP_WINDOW}s ...${NC}"
+    echo
+    bp_receiver_src | python3 -u - "$BP_TOKEN" "$BP_PORT" "$BP_ATTEMPTS" "$BP_WINDOW" "$BP_MAX_LOSS" "$BP_PASS_FILE"
+}
+
+# ---- standalone sender -----------------------------------------------------
+bp_probe_sender() {
+    echo
+    echo "======================================================"
+    echo "   BACKPACK PROBE - SENDER"
+    echo "======================================================"
+    echo "Start the receiver on the other machine FIRST."
+    echo "Needs root (raw socket)."
+    echo
+
+    read -rp "Receiver server REAL IP: " _t
+    _t="$(echo "$_t" | tr -d '[:space:]')"
+    [ -z "$_t" ] && { echo -e "${RED}[!] Receiver IP is required.${NC}"; return 1; }
+    local _target="$_t"
+
+    bp_prompt_params
+
+    echo
+    echo "Candidate forged sources. Examples:"
+    echo "  203.0.113.10                 single address"
+    echo "  1.0.0.0/24                   CIDR"
+    echo "  9.9.9.0-9.9.9.255            hyphen range"
+    echo "  @./targets.txt               one spec per line"
+    echo "  a comma-separated list is also accepted"
+    read -rp "Candidates: " _sp
+    [ -z "$_sp" ] && { echo -e "${RED}[!] At least one candidate is required.${NC}"; return 1; }
+    _sp="$(strip_spoof_arg "$_sp")"
+
+    echo
+    read -rp "Send interface (empty = kernel default): " _if
+    _if="$(echo "$_if" | tr -d '[:space:]')"
+
+    bp_prompt_confirm || { echo "Cancelled."; return 0; }
+
+    local _n
+    _n="$(bp_expand_specs "$BP_IPLIST" "$_sp" 2>/dev/null | tail -1)"
+    _n="${_n:-0}"
+    echo -e "${GREEN}[+] Expanded $_n candidate address(es).${NC}"
+    echo -e "${BLUE}[*] Sending probes to ${_target}:${BP_PORT} ...${NC}"
+    echo
+    bp_send_chunked "$_target" "$BP_PORT" "$BP_ATTEMPTS" "$BP_DELAY_MS" "$BP_TOKEN" "$_if" "$BP_IPLIST" "local" "local"
+
+    echo
+    echo "Now read the RECEIVER's table (SPOOF_IP / ARRIVED / LOSS%)."
+    echo "All 0/${BP_ATTEMPTS} means the provider drops forged packets -"
+    echo "no setting on the tunnel changes that."
+}
+
+# ---- automatic two-node, both directions ----------------------------------
+bp_probe_auto() {
+    echo
+    echo "======================================================"
+    echo "   BACKPACK PROBE - AUTOMATIC (BOTH DIRECTIONS)"
+    echo "======================================================"
+    echo "Runs the token probe Iran -> Foreign, then Foreign -> Iran."
+    echo "Each direction is reported separately."
+    echo
+
+    FOREIGN_IP=""
+    while [ -z "$FOREIGN_IP" ]; do
+        read -rp "Foreign Server IP: " FOREIGN_IP
+        FOREIGN_IP="$(echo "$FOREIGN_IP" | tr -d '[:space:]')"
+    done
+    read -rp "Foreign SSH Port [22]: " FOREIGN_PORT
+    FOREIGN_PORT="${FOREIGN_PORT:-22}"
+    read -rp "Foreign SSH Username [root]: " FOREIGN_USER
+    FOREIGN_USER="${FOREIGN_USER:-root}"
+    echo "SSH authentication:"
+    echo "  1) SSH key / ssh-agent [recommended, default]"
+    echo "  2) Password via sshpass [fallback]"
+    read -rp "Select [1-2, default 1]: " _ssh_mode
+    case "${_ssh_mode:-1}" in
+        2) SSH_AUTH_MODE="password" ;;
+        *) SSH_AUTH_MODE="key" ;;
+    esac
+    FOREIGN_PASS=""
+    if [ "$SSH_AUTH_MODE" = "password" ]; then
+        check_sshpass || return 1
+        read -s -rp "Foreign SSH Password: " FOREIGN_PASS
+        echo
+        [ -z "$FOREIGN_PASS" ] && { echo -e "${RED}[!] Empty password.${NC}"; return 1; }
+    fi
+
+    local _detected
+    _detected=$(ip route get "$FOREIGN_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+    echo
+    read -rp "Iran Server Real IP [$_detected]: " LOCAL_IP
+    LOCAL_IP="${LOCAL_IP:-$_detected}"
+    LOCAL_IP="$(echo "$LOCAL_IP" | tr -d '[:space:]')"
+
+    bp_prompt_params
+
+    echo
+    echo "Candidate forged sources (ip / cidr / range / @file / comma list):"
+    read -rp "Candidates: " _sp
+    [ -z "$_sp" ] && { echo -e "${RED}[!] Candidates required.${NC}"; return 1; }
+    BP_SPEC="$(strip_spoof_arg "$_sp")"
+
+    read -rp "Stop early after this many passing IPs (0 = run to the end) [${BP_TARGET_HITS}]: " _th
+    _th="${_th:-$BP_TARGET_HITS}"
+    [[ "$_th" =~ ^[0-9]+$ ]] && BP_TARGET_HITS="$_th"
+
+    read -rp "Sender batch size, IPs per chunk [${BP_CHUNK}]: " _b
+    _b="${_b:-$BP_CHUNK}"
+    [[ "$_b" =~ ^[0-9]+$ ]] && [ "$_b" -ge 1 ] && BP_CHUNK="$_b"
+
+    echo
+    echo "  Probe rate: ${BP_DELAY_MS}ms per packet, ${BP_CHUNK} IPs per chunk."
+    echo "  5 probes/IP at 5ms is about 25ms per address (5000 IPs ~= 2 min);"
+    echo "  at 1ms it is about 5ms per address (5000 IPs ~= 30s)."
+    echo
+    read -rp "Start? [y/N]: " _c
+    case "$_c" in y|Y|yes|YES) ;; *) echo "Cancelled."; return 0 ;; esac
+
+    echo
+    echo -e "${BLUE}[*] Testing SSH connection to Foreign server...${NC}"
+    if ! ssh_exec "echo SSH_OK" >/dev/null 2>&1; then
+        echo -e "${RED}[!] SSH connection failed. Check IP, port, username, auth mode.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] SSH connection successful.${NC}"
+
+    echo -e "${BLUE}[*] Checking python3 and raw-socket capability on Foreign server...${NC}"
+    local _rc
+    _rc=$(ssh_exec "command -v python3 >/dev/null 2>&1 && echo PY_OK || echo PY_MISSING")
+    if ! echo "$_rc" | grep -q PY_OK; then
+        echo -e "${RED}[!] python3 is missing on the Foreign server. Install it and retry.${NC}"
+        return 1
+    fi
+    _rc=$(ssh_exec "python3 -c 'import socket;socket.socket(socket.AF_INET,socket.SOCK_RAW,socket.IPPROTO_RAW)' 2>&1 && echo RAW_OK || echo RAW_FAIL")
+    if ! echo "$_rc" | grep -q RAW_OK; then
+        echo -e "${RED}[!] Foreign server cannot create raw sockets (need root there).${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] Foreign server is ready.${NC}"
+
+    echo -e "${BLUE}[*] Uploading probe sender to Foreign server...${NC}"
+    if ! bp_sender_src | ssh_exec "cat > /tmp/bp_sender_probe.py"; then
+        echo -e "${RED}[!] Could not upload the sender program.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] Uploaded.${NC}"
+
+    local _ipcount
+    _ipcount="$(bp_expand_specs "$BP_IPLIST" "$BP_SPEC" 2>/dev/null | tail -1)"
+    _ipcount="${_ipcount:-0}"
+    echo -e "${GREEN}[+] Expanded $_ipcount candidate address(es).${NC}"
+    [ "$_ipcount" -eq 0 ] && { echo -e "${RED}[!] Nothing to test.${NC}"; return 1; }
+
+    bp_run_direction_a
+    bp_run_direction_b
+
+    echo
+    echo "======================================================"
+    echo "   BACKPACK PROBE SUMMARY (separate from ICMP/UDP/TCP)"
+    echo "======================================================"
+    printf "%-30s | %-28s\n" "DIRECTION" "RESULT"
+    echo "------------------------------------------------------"
+    printf "%-30s | %-28s\n" "Direct  (Iran -> Foreign)" "$BP_DIR_A_RESULT"
+    printf "%-30s | %-28s\n" "Reverse (Foreign -> Iran)" "$BP_DIR_B_RESULT"
+    echo "======================================================"
+    echo
+}
+
+# Direction A: sender = this machine (Iran), receiver = Foreign server.
+bp_run_direction_a() {
+    local remote_rx="/tmp/bp_rx_a_$$.log"
+    local remote_pass="/tmp/bp_pass_a_$$.txt"
+    local rp
+    rp="$(remote_prefix_cmd)"
+
+    echo
+    echo -e "${CYAN}=== BACKPACK PROBE [A] Iran -> Foreign ===${NC}"
+    echo -e "${BLUE}[*] Starting receiver on the Foreign server...${NC}"
+
+    ssh_exec "${rp}rm -f '$remote_pass'; ${rp}timeout $((BP_WINDOW + 20)) python3 -u - '$BP_TOKEN' '$BP_PORT' '$BP_ATTEMPTS' '$BP_WINDOW' '$BP_MAX_LOSS' '$remote_pass'" \
+        < <(bp_receiver_src) > "$remote_rx" 2>&1 &
+    local rpid=$!
+
+    local waited=0
+    while [ "$waited" -lt 15 ]; do
+        grep -q BP_RECV_READY "$remote_rx" 2>/dev/null && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! grep -q BP_RECV_READY "$remote_rx" 2>/dev/null; then
+        echo -e "${RED}[!] Remote receiver did not start. Log:${NC}"
+        tail -20 "$remote_rx" 2>/dev/null
+        kill "$rpid" 2>/dev/null || true
+        BP_DIR_A_RESULT="ERROR (receiver)"
+        return 0
+    fi
+    echo -e "${GREEN}[+] Remote receiver listening.${NC}"
+
+    bp_send_chunked "$FOREIGN_IP" "$BP_PORT" "$BP_ATTEMPTS" "$BP_DELAY_MS" "$BP_TOKEN" "" "$BP_IPLIST" "local" "remote"
+
+    wait "$rpid" 2>/dev/null || true
+    bp_print_report "$remote_rx" "A"
+    local _pass
+    _pass="$(grep -c '^BP_PASS ' "$remote_rx" 2>/dev/null)"
+    _pass="${_pass:-0}"
+    if grep -q 'BP_RECV_NOTE' "$remote_rx" 2>/dev/null; then
+        BP_DIR_A_RESULT="BLOCKED (0 arrived)"
+    elif [ "$_pass" -gt 0 ]; then
+        BP_DIR_A_RESULT="$_pass IP(s) passed"
+    else
+        BP_DIR_A_RESULT="no IP met the threshold"
+    fi
+}
+
+# Direction B: receiver = this machine (Iran), sender = Foreign server.
+bp_run_direction_b() {
+    local local_rx="/tmp/bp_rx_b_$$.log"
+
+    echo
+    echo -e "${CYAN}=== BACKPACK PROBE [B] Foreign -> Iran ===${NC}"
+    echo -e "${BLUE}[*] Starting receiver locally...${NC}"
+    rm -f "$BP_PASSFILE_LOCAL"
+
+    bp_receiver_src | timeout $((BP_WINDOW + 20)) python3 -u - "$BP_TOKEN" "$BP_PORT" "$BP_ATTEMPTS" "$BP_WINDOW" "$BP_MAX_LOSS" "$BP_PASSFILE_LOCAL" > "$local_rx" 2>&1 &
+    local rpid=$!
+
+    local waited=0
+    while [ "$waited" -lt 15 ]; do
+        grep -q BP_RECV_READY "$local_rx" 2>/dev/null && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! grep -q BP_RECV_READY "$local_rx" 2>/dev/null; then
+        echo -e "${RED}[!] Local receiver did not start. Log:${NC}"
+        tail -20 "$local_rx" 2>/dev/null
+        kill "$rpid" 2>/dev/null || true
+        BP_DIR_B_RESULT="ERROR (receiver)"
+        return 0
+    fi
+    echo -e "${GREEN}[+] Local receiver listening.${NC}"
+
+    echo -e "${BLUE}[*] Sending probes from the Foreign server...${NC}"
+    bp_send_chunked "$LOCAL_IP" "$BP_PORT" "$BP_ATTEMPTS" "$BP_DELAY_MS" "$BP_TOKEN" "" "$BP_IPLIST" "remote" "local"
+
+    wait "$rpid" 2>/dev/null || true
+    bp_print_report "$local_rx" "B"
+    local _pass
+    _pass="$(grep -c '^BP_PASS ' "$local_rx" 2>/dev/null)"
+    _pass="${_pass:-0}"
+    if grep -q 'BP_RECV_NOTE' "$local_rx" 2>/dev/null; then
+        BP_DIR_B_RESULT="BLOCKED (0 arrived)"
+    elif [ "$_pass" -gt 0 ]; then
+        BP_DIR_B_RESULT="$_pass IP(s) passed"
+    else
+        BP_DIR_B_RESULT="no IP met the threshold"
+    fi
+}
+
+# Pretty-print a receiver log.
+bp_print_report() {
+    local log="$1" label="$2"
+    echo
+    echo "---- direction $label result ----"
+    if [ -f "$log" ]; then
+        sed -n '/BP_RECV_TABLE_BEGIN/,/BP_RECV_PASSING/p' "$log" 2>/dev/null
+        grep '^BP_PASS ' "$log" 2>/dev/null | head -20
+        grep '^BP_RECV_NOTE' "$log" 2>/dev/null || true
+    else
+        echo "(no log)"
+    fi
+}
+
+bp_probe_menu() {
+    echo
+    echo "======================================================"
+    echo "      BACKPACK-STYLE TOKEN PROBE TEST (UDP)"
+    echo "======================================================"
+    echo "Token-authenticated, sequence-numbered UDP probes that report"
+    echo "a per-IP loss percentage. Separate from the ICMP/UDP/TCP raw"
+    echo "probe phases; its numbers are never merged with theirs."
+    echo
+    echo "1) Automatic - both directions over SSH"
+    echo "2) Receiver only  (start this side first)"
+    echo "3) Sender only"
+    echo "4) Back"
+    echo
+    read -rp "Select [1-4, default 4]: " _bp_mode
+    case "${_bp_mode:-4}" in
+        1) bp_probe_auto ;;
+        2) bp_probe_receiver ;;
+        3) bp_probe_sender ;;
+        *) return 0 ;;
+    esac
+}
+
+
+# ==========================================================================
+#  FULL SWEEP  (menu option 4)
+# ==========================================================================
+#  Runs EVERY test in one pass and prints one consolidated report.
+#
+#  Phases per direction:
+#    1  baseline (unspoofed reachability)  -- abort if this fails
+#    2  SNAT-ICMP       (existing SNAT rule path, ICMP)
+#    3  RAW scapy ICMP
+#    4  RAW nping ICMP  (reply-based proof)
+#    5  RAW scapy UDP
+#    6  RAW scapy TCP SYN   (egress-only: a forged source gets no reply)
+#    7  TTL bisection with a FORGED source (locates the drop layer)
+#    8  BackPack token probe (UDP, loss%)  -- SEPARATE section, own table
+#
+#  Phase 8 never contributes to phases 2-5 counters and vice versa.
+# ==========================================================================
+
+FS_DIR_A="NOT_RUN"
+FS_DIR_B="NOT_RUN"
+
+fs_prompt_targets() {
+    FOREIGN_IP=""
+    while [ -z "$FOREIGN_IP" ]; do
+        read -rp "Foreign Server IP: " FOREIGN_IP
+        FOREIGN_IP="$(echo "$FOREIGN_IP" | tr -d '[:space:]')"
+    done
+    read -rp "Foreign SSH Port [22]: " FOREIGN_PORT
+    FOREIGN_PORT="${FOREIGN_PORT:-22}"
+    read -rp "Foreign SSH Username [root]: " FOREIGN_USER
+    FOREIGN_USER="${FOREIGN_USER:-root}"
+
+    echo "SSH authentication:"
+    echo "  1) SSH key / ssh-agent [recommended, default]"
+    echo "  2) Password via sshpass [fallback]"
+    read -rp "Select [1-2, default 1]: " _fs_ssh
+    case "${_fs_ssh:-1}" in
+        2) SSH_AUTH_MODE="password" ;;
+        *) SSH_AUTH_MODE="key" ;;
+    esac
+    FOREIGN_PASS=""
+    if [ "$SSH_AUTH_MODE" = "password" ]; then
+        check_sshpass || return 1
+        read -s -rp "Foreign SSH Password: " FOREIGN_PASS
+        echo
+        [ -z "$FOREIGN_PASS" ] && { echo -e "${RED}[!] Empty password.${NC}"; return 1; }
+    fi
+
+    local _detected
+    _detected=$(ip route get "$FOREIGN_IP" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+    echo
+    read -rp "Iran Server Real IP [$_detected]: " LOCAL_IP
+    LOCAL_IP="${LOCAL_IP:-$_detected}"
+    LOCAL_IP="$(echo "$LOCAL_IP" | tr -d '[:space:]')"
+
+    echo
+    read -rp "Spoof Source IP/CIDR or file [1.1.1.1, 10.99.0.0/24, @./list.txt]: " _fs_sp
+    _fs_sp="${_fs_sp:-1.1.1.1}"
+    _fs_sp="$(strip_spoof_arg "$_fs_sp")"
+
+    local _spoof_file="" _from_file=0
+    if [[ "$_fs_sp" == @* ]]; then
+        _spoof_file="${_fs_sp#@}"; _from_file=1
+    elif [ -f "$_fs_sp" ]; then
+        _spoof_file="$_fs_sp"; _from_file=1
+    fi
+
+    FS_FROM_FILE="$_from_file"
+    FS_SPOOF_FILE="$_spoof_file"
+
+    if [ "$_from_file" -eq 1 ]; then
+        if [ -z "$_spoof_file" ] || [ ! -f "$_spoof_file" ]; then
+            echo -e "${RED}[!] Spoof list file not found: ${_spoof_file:-<empty>}${NC}"
+            return 1
+        fi
+        mapfile -t SPOOF_TARGETS < <(load_spoof_list_file "$_spoof_file")
+        [ "${#SPOOF_TARGETS[@]}" -eq 0 ] && { echo -e "${RED}[!] No valid entries.${NC}"; return 1; }
+        FS_FIRST_TARGET="${SPOOF_TARGETS[0]}"
+    else
+        SPOOF_CIDR=""; SPOOF_REP_IP=""; SPOOF_FILTER=""
+        if ! normalize_spoof_input "$_fs_sp"; then
+            echo -e "${RED}[!] Invalid spoof IP/CIDR.${NC}"
+            return 1
+        fi
+        FS_FIRST_TARGET="$_fs_sp"
+    fi
+
+    # Phase results are reported for the first target; the full sweep focuses
+    # on one representative forged source so the report stays readable.
+    SPOOF_CIDR=""; SPOOF_REP_IP=""; SPOOF_FILTER=""
+    normalize_spoof_input "$FS_FIRST_TARGET" || return 1
+    FS_SPOOF_SRC="$SPOOF_IP"
+    return 0
+}
+
+# Preflight: plain, unspoofed reachability both ways. If this fails there is
+# no point reporting results, because a failure would be misread as filtering.
+fs_preflight() {
+    echo
+    echo "======================================================"
+    echo "   PHASE 0: PREFLIGHT (unspoofed baseline)"
+    echo "======================================================"
+
+    echo -e "${BLUE}[*] Resolving interfaces...${NC}"
+    local local_if
+    local_if="$(capture_iface_local "$FOREIGN_IP" 2>/dev/null)"
+    local remote_if
+    remote_if="$(remote_capture_iface 2>/dev/null)"
+    echo "  Iran    egress iface : ${local_if:-<auto>}"
+    echo "  Foreign egress iface : ${remote_if:-<auto>}"
+
+    echo -e "${BLUE}[*] Baseline Iran -> Foreign ...${NC}"
+    if ping -c 2 -W 2 "$FOREIGN_IP" >/dev/null 2>&1; then
+        echo -e "${GREEN}[+] Iran -> Foreign reachable.${NC}"
+    else
+        echo -e "${RED}[!] Iran -> Foreign NOT reachable without spoofing.${NC}"
+        echo -e "${RED}    Every later phase would be meaningless. Aborting the sweep.${NC}"
+        FS_DIR_A="ABORTED (baseline failed)"
+        FS_DIR_B="ABORTED (baseline failed)"
+        return 1
+    fi
+
+    echo -e "${BLUE}[*] Baseline Foreign -> Iran ...${NC}"
+    if ssh_exec "ping -c 2 -W 2 '$LOCAL_IP' >/dev/null 2>&1 && echo R_OK || echo R_FAIL" | grep -q R_OK; then
+        echo -e "${GREEN}[+] Foreign -> Iran reachable.${NC}"
+    else
+        echo -e "${YELLOW}[!] Foreign -> Iran baseline failed (ICMP may be filtered).${NC}"
+        echo -e "${YELLOW}    The reverse direction will be reported as INCONCLUSIVE, not BLOCKED.${NC}"
+    fi
+    FS_PREFLIGHT_OK=1
+    return 0
+}
+
+# Run one transport through the existing direct/reverse machinery.
+fs_run_transport() {
+    local tr="$1"
+    TEST_TRANSPORT="$tr"
+    case "$tr" in
+        udp) TEST_PORT="$UDP_TEST_PORT" ;;
+        tcp) TEST_PORT="$TCP_TEST_PORT" ;;
+        *)   TEST_PORT="0" ;;
+    esac
+    echo
+    echo -e "${CYAN}  -- transport: ${tr} --${NC}"
+    direct_res="SKIPPED"; reverse_res="SKIPPED"
+    direct_spoof_cnt=0; direct_new_real=0; direct_nping_proven=0; direct_raw_ran=0
+    reverse_spoof_cnt=0; reverse_new_real=0; reverse_nping_proven=0; reverse_raw_ran=0
+    direct_test
+    reverse_test
+    FS_ROW_D="$direct_res"
+    FS_ROW_R="$reverse_res"
+}
+
+full_sweep() {
+    echo
+    echo "======================================================"
+    echo "   FULL SWEEP - EVERY TEST, BOTH DIRECTIONS"
+    echo "======================================================"
+    echo "Phases: baseline, SNAT-ICMP, RAW ICMP, RAW nping,"
+    echo "        RAW UDP, RAW TCP, spoofed TTL bisection,"
+    echo "        BackPack token probe (separate section)."
+    echo
+    echo "This runs DETECTION ONLY - it never saves configuration."
+    echo
+
+    if ! fs_prompt_targets; then
+        echo -e "${RED}[!] Setup cancelled.${NC}"
+        return 1
+    fi
+
+    echo
+    echo "  Iran    : $LOCAL_IP"
+    echo "  Foreign : $FOREIGN_IP"
+    echo "  Spoof   : $FS_FIRST_TARGET"
+    [ "$FS_FROM_FILE" -eq 1 ] && echo "  From file: $FS_SPOOF_FILE"
+    echo
+    read -rp "Start the full sweep? [y/N]: " _c
+    case "$_c" in y|Y|yes|YES) ;; *) echo "Cancelled."; return 0 ;; esac
+
+    echo
+    echo -e "${BLUE}[*] Testing SSH connection...${NC}"
+    if ! ssh_exec "echo SSH_OK" >/dev/null 2>&1; then
+        echo -e "${RED}[!] SSH connection failed. Check IP, port, username, auth mode.${NC}"
+        return 1
+    fi
+    echo -e "${GREEN}[+] SSH connection successful.${NC}"
+
+    FS_PREFLIGHT_OK=0
+    fs_preflight || return 1
+
+    # ---------- phases 2..7 ----------
+    FS_SNAT_D=""; FS_SNAT_R=""
+    FS_ICMP_D=""; FS_ICMP_R=""
+    FS_UDP_D="";  FS_UDP_R=""
+    FS_TCP_D="";  FS_TCP_R=""
+
+    echo
+    echo "======================================================"
+    echo "   PHASE 1: SNAT probe (ICMP, existing path)"
+    echo "======================================================"
+    fs_run_transport icmp
+    FS_SNAT_D="$FS_ROW_D"; FS_SNAT_R="$FS_ROW_R"
+
+    echo
+    echo "======================================================"
+    echo "   PHASE 2: RAW probe - UDP"
+    echo "======================================================"
+    fs_run_transport udp
+    FS_UDP_D="$FS_ROW_D"; FS_UDP_R="$FS_ROW_R"
+
+    echo
+    echo "======================================================"
+    echo "   PHASE 3: RAW probe - TCP SYN (egress only)"
+    echo "======================================================"
+    echo -e "${YELLOW}[*] A forged TCP SYN cannot receive a reply, so this phase"
+    echo -e "    proves only that your provider LET THE PACKET OUT.${NC}"
+    fs_run_transport tcp
+    FS_TCP_D="$FS_ROW_D"; FS_TCP_R="$FS_ROW_R"
+
+    FS_TTL_D="not run"; FS_TTL_R="not run"
+    echo
+    echo "======================================================"
+    echo "   PHASE 4: TTL bisection with a FORGED source"
+    echo "======================================================"
+    TTL_PATH_PROBE=2
+    if [ "${TTL_MAX:-0}" -lt 1 ]; then TTL_MAX=12; fi
+    read -rp "Run the spoofed TTL sweep? [y/N]: " _t
+    case "$_t" in
+        y|Y|yes|YES)
+            spoofed_ttl_probe_direct
+            FS_TTL_D="done (see table)"
+            spoofed_ttl_probe_reverse
+            FS_TTL_R="done (see table)"
+            ;;
+        *)  echo "Skipped." ;;
+    esac
+
+    # ---------- phase 8: BackPack token probe ----------
+    echo
+    echo "======================================================"
+    echo "   PHASE 5: BACKPACK TOKEN PROBE (UDP, loss%)"
+    echo "======================================================"
+    echo "This phase is reported SEPARATELY. Its counts are never"
+    echo "merged with the RAW probe phases above."
+    echo
+    read -rp "Run the BackPack token probe too? [y/N]: " _bp
+    BP_SWEEP_D="not run"; BP_SWEEP_R="not run"
+    case "$_bp" in
+        y|Y|yes|YES)
+            BP_SPEC="$FS_FIRST_TARGET"
+            read -rp "Probes per IP [${BP_ATTEMPTS}]: " _n
+            _n="${_n:-$BP_ATTEMPTS}"
+            [[ "$_n" =~ ^[0-9]+$ ]] && [ "$_n" -ge 2 ] && [ "$_n" -le 50 ] && BP_ATTEMPTS="$_n"
+            read -rp "Inter-probe delay ms [${BP_DELAY_MS}]: " _n
+            _n="${_n:-$BP_DELAY_MS}"
+            [[ "$_n" =~ ^[0-9]+$ ]] && BP_DELAY_MS="$_n"
+
+            if bp_expand_specs "$BP_IPLIST" "$BP_SPEC" >/dev/null 2>&1; then
+                bp_run_direction_a
+                BP_SWEEP_D="$BP_DIR_A_RESULT"
+                bp_run_direction_b
+                BP_SWEEP_R="$BP_DIR_B_RESULT"
+            else
+                echo -e "${YELLOW}[!] Could not expand the candidate list; skipping.${NC}"
+            fi
+            ;;
+        *)  echo "Skipped." ;;
+    esac
+
+    # ---------- consolidated report ----------
+    echo
+    echo "======================================================"
+    echo "            FULL SWEEP - FINAL REPORT"
+    echo "======================================================"
+    printf "%-26s | %-26s | %-26s\n" "PHASE" "IRAN -> FOREIGN" "FOREIGN -> IRAN"
+    echo "----------------------------------------------------------------------------------"
+    printf "%-26s | %-26s | %-26s\n" "Baseline (unspoofed)" "OK" "checked above"
+    printf "%-26s | %-26s | %-26s\n" "SNAT-ICMP"         "${FS_SNAT_D:-n/a}" "${FS_SNAT_R:-n/a}"
+    printf "%-26s | %-26s | %-26s\n" "RAW-scapy-ICMP"    "${FS_ICMP_D:-n/a}" "${FS_ICMP_R:-n/a}"
+    printf "%-26s | %-26s | %-26s\n" "RAW-scapy-UDP"     "${FS_UDP_D:-n/a}"  "${FS_UDP_R:-n/a}"
+    printf "%-26s | %-26s | %-26s\n" "RAW-TCP-SYN"       "${FS_TCP_D:-n/a}"  "${FS_TCP_R:-n/a}"
+    printf "%-26s | %-26s | %-26s\n" "TTL-bisection"     "${FS_TTL_D:-n/a}"  "${FS_TTL_R:-n/a}"
+    printf "%-26s | %-26s | %-26s\n" "BackPack-token"    "${BP_SWEEP_D:-n/a}" "${BP_SWEEP_R:-n/a}"
+    echo "----------------------------------------------------------------------------------"
+    echo
+    echo "Note: RAW-TCP-SYN is egress-only; a forged SYN gets no reply."
+    echo "      BackPack-token reports per-IP loss% and is kept separate."
+    echo "======================================================"
+    echo
+}
+
 main() {
     require_root
     check_tools || exit 1
@@ -2776,10 +3870,12 @@ main() {
     echo "1) Automated Test (Iran <-> Foreign via SSH)"
     echo "2) Manual Sender"
     echo "3) Manual Receiver"
-    echo "4) Exit"
+    echo "4) Full Sweep (every test, both directions, single report)"
+    echo "5) BackPack-probe Test (UDP, loss% based) - separate section"
+    echo "6) Exit"
     echo
 
-    read -rp "Select [1-4]: " MODE
+    read -rp "Select [1-6]: " MODE
 
     case "$MODE" in
         1)
@@ -2790,6 +3886,12 @@ main() {
             ;;
         3)
             receiver
+            ;;
+        4)
+            full_sweep
+            ;;
+        5)
+            bp_probe_menu
             ;;
         *)
             exit 0
