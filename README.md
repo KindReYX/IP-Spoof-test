@@ -1065,6 +1065,7 @@ You can select the transport used by the spoofed RAW probe:
 1) ICMP [default]
 2) UDP
 3) TCP
+4) ALL
 ```
 
 ### ICMP
@@ -1079,6 +1080,16 @@ Sends a UDP probe to a destination port that you choose. The default test port i
 33434
 ```
 
+### ALL
+
+Runs **ICMP, UDP, and TCP sequentially** for every selected spoof target and direction. Each transport has its own isolated result and is shown separately in the terminal summary and CSV output.
+
+This is useful when a provider treats protocols differently. For example, one path may allow spoofed ICMP while dropping spoofed TCP.
+
+In ALL mode, the tool asks separately for the UDP and TCP destination ports. ICMP does not use a destination port.
+
+> An ICMP PASS does not automatically make UDP or TCP PASS. Each transport is evaluated independently. ICMP-only `nping` reply proof is never used to mark a UDP/TCP test as successful; UDP/TCP require matching receiver capture evidence.
+
 ### TCP
 
 Sends a TCP SYN probe to a destination port that you choose. The default test port is:
@@ -1087,7 +1098,11 @@ Sends a TCP SYN probe to a destination port that you choose. The default test po
 443
 ```
 
+TCP success is proven by **destination-side packet capture of the spoofed SYN**. A SYN-ACK reply is **not required** because any reply is routed to the spoofed source address rather than back to the sender.
+
 > The normal non-spoofed connectivity baseline remains ICMP in every mode. The selected transport applies to the spoofed RAW probe so results can be compared across ICMP, UDP, and TCP without claiming that one protocol represents all protocols.
+
+The CSV files include a `transport` column so results from ALL mode remain distinguishable.
 
 ---
 
@@ -1192,24 +1207,50 @@ If key authentication is not available, select password mode. The password is re
 
 ---
 
-## 5. Optional TTL path diagnostic
+## 5. TTL diagnostics
 
-The Advanced Options menu can enable an optional TTL diagnostic.
-
-Example:
+The Advanced Options menu now offers four TTL modes:
 
 ```text
-Enable TTL path diagnostic? [y/N]: y
-Maximum TTL to test [12]: 12
+0) Off [default]
+1) Normal TTL baseline
+2) Receiver-assisted SPOOFED TTL sweep
+3) Both baseline + receiver-assisted spoofed sweep
 ```
 
-The diagnostic sends a normal, **non-spoofed** ICMP baseline with increasing TTL values and records visible hop responses.
+### Normal TTL baseline
 
-It is useful for teaching and comparing normal path behavior, but it is intentionally described as a diagnostic rather than an exact drop-point detector.
+This is the ordinary non-spoofed path diagnostic. It sends normal probes with increasing TTL values and records visible hop responses. It is useful for understanding the normal route between the two controlled servers.
 
-It **cannot reliably prove** that a spoofed packet was dropped specifically by a host, hypervisor, ToR switch, or a particular transit device. Some layers are not visible IP hops, and ICMP Time Exceeded responses may be filtered or returned to a different source address.
+### Receiver-assisted SPOOFED TTL sweep
 
-Use the output as hop-level evidence only.
+This mode uses the fact that both endpoints are under your control. The sender transmits spoofed packets using the currently selected transport with initial TTL values from `1` through `TTL_MAX`. At the same time, the receiving server runs a matching packet capture.
+
+Every TTL probe receives a unique IPv4 ID so the receiver can correlate exactly which initial TTL values actually reached it. The output looks like this:
+
+```text
+TTL 1   : NOT SEEN at receiver
+TTL 2   : NOT SEEN at receiver
+TTL 3   : NOT SEEN at receiver
+TTL 4   : REACHED receiver (1 capture)
+TTL 5   : REACHED receiver (1 capture)
+...
+First initial TTL observed at receiver: 4
+```
+
+The receiver observation is authoritative for **arrival**. The script does not require an ICMP Echo Reply, UDP response, SYN-ACK, or any other response to the spoofed sender.
+
+When `ALL` transport mode is selected, the receiver-assisted TTL sweep is performed independently for ICMP, UDP, and TCP.
+
+### What this does and does not prove
+
+This feature is more useful than a normal traceroute for spoofing experiments because the TTL sweep itself uses the selected spoofed source address. However, it still must not be interpreted as an exact hypervisor/ToR/filter locator.
+
+If a spoofed packet reaches the receiver, the tool can prove that the tested initial TTL was sufficient for that packet to traverse the path. If no spoofed TTL reaches the receiver, the packet was filtered, dropped, or expired somewhere before the destination.
+
+To identify the exact intermediate hop from ICMP Time Exceeded messages, the **spoofed source address itself must also be under your control** so those ICMP errors can be captured there. Merely controlling the sender and destination is not enough when the selected spoof source belongs somewhere else.
+
+This distinction is intentional so the tool does not overstate what the measurement proves.
 
 ---
 
@@ -1226,8 +1267,9 @@ Transport for spoofed RAW probe:
   1) ICMP [default]
   2) UDP
   3) TCP
-Select transport [1-3, default 1]: 2
-Destination port for udp [33434]: 33434
+Select transport [1-4, default 1]: 4
+Destination UDP port [33434]: 33434
+Destination TCP port [443]: 443
 
 Probe rate:
   1) Safe [default] - 50ms delay between packets
@@ -1241,8 +1283,13 @@ Capture interface:
   <interface name>
 Capture interface [auto]: auto
 
-Optional TTL path diagnostic:
-Enable TTL path diagnostic? [y/N]: n
+TTL diagnostics:
+  0) Off [default]
+  1) Normal TTL baseline
+  2) Receiver-assisted SPOOFED TTL sweep
+  3) Both baseline + receiver-assisted spoofed sweep
+Select TTL diagnostic [0-3, default 0]: 3
+Maximum TTL to test [12]: 12
 ======================================================
 ```
 

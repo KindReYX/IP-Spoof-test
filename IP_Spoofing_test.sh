@@ -38,15 +38,18 @@ FOREIGN_PASS=""
 LOCAL_IP=""
 
 # ---- v2 safe/advanced test options ----
-TEST_TRANSPORT="icmp"       # icmp | udp | tcp (RAW spoof probe transport)
-TEST_PORT="33434"           # used for UDP/TCP probes
+TEST_TRANSPORT="icmp"       # icmp | udp | tcp | all (selected mode; loop resolves all to individual transports)
+TEST_PORT="33434"           # active port for the current UDP/TCP probe
+UDP_TEST_PORT="33434"       # default UDP destination port
+TCP_TEST_PORT="443"         # default TCP destination port
 PROBE_DELAY_SEC="0.05"      # safe default: 50ms between packets
 NPING_DELAY_MS="50"
 FAST_MODE=0
 CAPTURE_INTERFACE="auto"    # auto or explicit interface name
 SSH_AUTH_MODE="key"         # key | password
-TTL_PATH_PROBE=0             # optional educational path diagnostic
+TTL_PATH_PROBE=0             # 0=off, 1=normal baseline, 2=spoofed receiver-assisted, 3=both
 TTL_MAX=12
+TTL_TAG_BASE=40000            # IP-ID base used to correlate spoofed TTL probes at receiver
 
 # ---- CSV + per-IP tracking ----
 CIDR_SAMPLE_MAX=3
@@ -521,16 +524,16 @@ write_csv_results() {
     if [ -z "${SPOOF_CIDR:-}" ]; then
         # ---------- SINGLE IP: summary + full (same 2 fixed files) ----------
         {
-            echo "timestamp,spoof_ip,iran_ip,foreign_ip,direction,result,status,spoofed_pkts,real_leaked,nping_proof,raw_used"
+            echo "timestamp,transport,spoof_ip,iran_ip,foreign_ip,direction,result,status,spoofed_pkts,real_leaked,nping_proof,raw_used"
             if [ "${direct_res:-SKIPPED}" != "SKIPPED" ]; then
-                echo "$ts_iso,$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},direct,$d_res_s,$d_status,${direct_spoof_cnt:-0},${direct_new_real:-0},${direct_nping_proven:-0},${direct_raw_ran:-0}"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},direct,$d_res_s,$d_status,${direct_spoof_cnt:-0},${direct_new_real:-0},${direct_nping_proven:-0},${direct_raw_ran:-0}"
             else
-                echo "$ts_iso,$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},direct,SKIPPED,SKIPPED,0,0,0,0"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},direct,SKIPPED,SKIPPED,0,0,0,0"
             fi
             if [ "${reverse_res:-SKIPPED}" != "SKIPPED" ]; then
-                echo "$ts_iso,$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,$r_res_s,$r_status,${reverse_spoof_cnt:-0},${reverse_new_real:-0},${reverse_nping_proven:-0},${reverse_raw_ran:-0}"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,$r_res_s,$r_status,${reverse_spoof_cnt:-0},${reverse_new_real:-0},${reverse_nping_proven:-0},${reverse_raw_ran:-0}"
             else
-                echo "$ts_iso,$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,SKIPPED,SKIPPED,0,0,0,0"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,SKIPPED,SKIPPED,0,0,0,0"
             fi
         } | csv_sink "$summary" "$_append" || {
             echo -e "${RED}[!] Could not write CSV: $summary${NC}"
@@ -538,20 +541,20 @@ write_csv_results() {
         }
         # Full per-IP detail for single IP (so we always produce 2 files).
         {
-            echo "timestamp,spoof_cidr,spoof_ip,direction,sent_est,received_pkts,status,method,note"
+            echo "timestamp,transport,spoof_cidr,spoof_ip,direction,sent_est,received_pkts,status,method,note"
             if [ "${direct_res:-SKIPPED}" != "SKIPPED" ]; then
                 _d_st="$(result_to_status "${direct_res:-}")"
                 [ "$_d_st" = "SKIPPED" ] && _d_st="NOT_WORKED"
                 _d_rcvd="${direct_spoof_cnt:-0}"
                 _d_m="SNAT"; [ "${direct_raw_ran:-0}" -eq 1 ] && _d_m="SNAT+RAW"
-                echo "$ts_iso,$spoof_label,$spoof_label,direct,5,$_d_rcvd,$_d_st,$_d_m,"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,$spoof_label,direct,5,$_d_rcvd,$_d_st,$_d_m,"
             fi
             if [ "${reverse_res:-SKIPPED}" != "SKIPPED" ]; then
                 _r_st="$(result_to_status "${reverse_res:-}")"
                 [ "$_r_st" = "SKIPPED" ] && _r_st="NOT_WORKED"
                 _r_rcvd="${reverse_spoof_cnt:-0}"
                 _r_m="SNAT+nft"; [ "${reverse_raw_ran:-0}" -eq 1 ] && _r_m="SNAT+nft+RAW"
-                echo "$ts_iso,$spoof_label,$spoof_label,reverse,10,$_r_rcvd,$_r_st,$_r_m,"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$spoof_label,$spoof_label,reverse,10,$_r_rcvd,$_r_st,$_r_m,"
             fi
         } | csv_sink "$full" "$_append" || {
             echo -e "${RED}[!] Could not write CSV: $full${NC}"
@@ -647,12 +650,12 @@ write_csv_results() {
 
         # ----- File 1: very summarized (one row per tested direction) -----
         {
-            echo "timestamp,spoof_cidr,iran_ip,foreign_ip,direction,overall_result,status,total_spoofed_pkts,worked_ips,worked_ip_list,tested_ips,total_hosts_in_cidr,nping_proof"
+            echo "timestamp,transport,spoof_cidr,iran_ip,foreign_ip,direction,overall_result,status,total_spoofed_pkts,worked_ips,worked_ip_list,tested_ips,total_hosts_in_cidr,nping_proof"
             if [ "${direct_res:-SKIPPED}" != "SKIPPED" ]; then
-                echo "$ts_iso,$SPOOF_CIDR,${LOCAL_IP:-},${FOREIGN_IP:-},direct,$d_res_s,$d_status,${direct_spoof_cnt:-0},$d_worked,$(csv_safe "$d_worked_list"),${#tested_ips[@]},$host_total,${direct_nping_proven:-0}"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$SPOOF_CIDR,${LOCAL_IP:-},${FOREIGN_IP:-},direct,$d_res_s,$d_status,${direct_spoof_cnt:-0},$d_worked,$(csv_safe "$d_worked_list"),${#tested_ips[@]},$host_total,${direct_nping_proven:-0}"
             fi
             if [ "${reverse_res:-SKIPPED}" != "SKIPPED" ]; then
-                echo "$ts_iso,$SPOOF_CIDR,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,$r_res_s,$r_status,${reverse_spoof_cnt:-0},$r_worked,$(csv_safe "$r_worked_list"),${#tested_ips[@]},$host_total,${reverse_nping_proven:-0}"
+                echo "$ts_iso,${TEST_TRANSPORT:-icmp},$SPOOF_CIDR,${LOCAL_IP:-},${FOREIGN_IP:-},reverse,$r_res_s,$r_status,${reverse_spoof_cnt:-0},$r_worked,$(csv_safe "$r_worked_list"),${#tested_ips[@]},$host_total,${reverse_nping_proven:-0}"
             fi
         } | csv_sink "$summary" "$_append" || {
             echo -e "${RED}[!] Could not write CSV: $summary${NC}"
@@ -662,7 +665,7 @@ write_csv_results() {
         # ----- File 2: full per-IP detail -----
         # ----- File 2: full per-IP detail (fast for full ranges: O(N) lookups, no per-row forks) -----
         {
-            echo "timestamp,spoof_cidr,spoof_ip,direction,sent_est,received_pkts,status,method,note"
+            echo "timestamp,transport,spoof_cidr,spoof_ip,direction,sent_est,received_pkts,status,method,note"
             # union of tested + observed ips so nothing seen on wire is lost
             declare -A all_ips tested_set
             local _t
@@ -717,7 +720,7 @@ write_csv_results() {
                     fi
                     # fast path: notes here contain no commas/quotes, skip csv_safe fork
                     if [[ "$note" == *[,\"\"]* ]]; then note="$(csv_safe "$note")"; fi
-                    echo "$ts_iso,$SPOOF_CIDR,$ip,direct,$sent,$rcvd,$status,$method,$note"
+                    echo "$ts_iso,${TEST_TRANSPORT:-icmp},$SPOOF_CIDR,$ip,direct,$sent,$rcvd,$status,$method,$note"
                 done <<< "$sorted_ips"
             fi
             # reverse rows
@@ -756,7 +759,7 @@ write_csv_results() {
                         [ "$sent" -eq 0 ] && method="observed-only"
                     fi
                     if [[ "$note" == *[,\"\"]* ]]; then note="$(csv_safe "$note")"; fi
-                    echo "$ts_iso,$SPOOF_CIDR,$ip,reverse,$sent,$rcvd,$status,$method,$note"
+                    echo "$ts_iso,${TEST_TRANSPORT:-icmp},$SPOOF_CIDR,$ip,reverse,$sent,$rcvd,$status,$method,$note"
                 done <<< "$sorted_ips"
             fi
         } | csv_sink "$full" "$_append" || {
@@ -1110,19 +1113,33 @@ configure_test_options() {
     echo "  1) ICMP [default] - ICMP Echo probe; best compatibility with the original test."
     echo "  2) UDP           - Sends a UDP probe to a controlled destination port."
     echo "  3) TCP           - Sends a TCP SYN probe to a controlled destination port."
+    echo "  4) ALL           - Runs ICMP, UDP, and TCP sequentially and reports each result separately."
     echo "Note: the non-spoofed connectivity baseline remains ICMP for all modes."
-    read -rp "Select transport [1-3, default 1]: " _tr
+    read -rp "Select transport [1-4, default 1]: " _tr
     case "${_tr:-1}" in
-        2) TEST_TRANSPORT="udp"; TEST_PORT="33434" ;;
-        3) TEST_TRANSPORT="tcp"; TEST_PORT="443" ;;
+        2) TEST_TRANSPORT="udp"; TEST_PORT="$UDP_TEST_PORT" ;;
+        3) TEST_TRANSPORT="tcp"; TEST_PORT="$TCP_TEST_PORT" ;;
+        4) TEST_TRANSPORT="all" ;;
         *) TEST_TRANSPORT="icmp" ;;
     esac
-    if [ "$TEST_TRANSPORT" != "icmp" ]; then
-        read -rp "Destination port for $TEST_TRANSPORT [${TEST_PORT}]: " _port
-        _port="${_port:-$TEST_PORT}"
-        if [[ "$_port" =~ ^[0-9]+$ ]] && [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ]; then
-            TEST_PORT="$_port"
-        fi
+    if [ "$TEST_TRANSPORT" = "udp" ]; then
+        read -rp "Destination UDP port [${UDP_TEST_PORT}]: " _port
+        _port="${_port:-$UDP_TEST_PORT}"
+        if [[ "$_port" =~ ^[0-9]+$ ]] && [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ]; then UDP_TEST_PORT="$_port"; fi
+        TEST_PORT="$UDP_TEST_PORT"
+    elif [ "$TEST_TRANSPORT" = "tcp" ]; then
+        read -rp "Destination TCP port [${TCP_TEST_PORT}]: " _port
+        _port="${_port:-$TCP_TEST_PORT}"
+        if [[ "$_port" =~ ^[0-9]+$ ]] && [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ]; then TCP_TEST_PORT="$_port"; fi
+        TEST_PORT="$TCP_TEST_PORT"
+    elif [ "$TEST_TRANSPORT" = "all" ]; then
+        echo "ALL mode uses separate destination ports for UDP and TCP."
+        read -rp "Destination UDP port [${UDP_TEST_PORT}]: " _udp_port
+        _udp_port="${_udp_port:-$UDP_TEST_PORT}"
+        if [[ "$_udp_port" =~ ^[0-9]+$ ]] && [ "$_udp_port" -ge 1 ] && [ "$_udp_port" -le 65535 ]; then UDP_TEST_PORT="$_udp_port"; fi
+        read -rp "Destination TCP port [${TCP_TEST_PORT}]: " _tcp_port
+        _tcp_port="${_tcp_port:-$TCP_TEST_PORT}"
+        if [[ "$_tcp_port" =~ ^[0-9]+$ ]] && [ "$_tcp_port" -ge 1 ] && [ "$_tcp_port" -le 65535 ]; then TCP_TEST_PORT="$_tcp_port"; fi
     fi
 
     echo
@@ -1146,12 +1163,25 @@ configure_test_options() {
     CAPTURE_INTERFACE="${_iface:-auto}"
 
     echo
-    echo "Optional TTL path diagnostic:"
-    echo "  This is an educational path probe, NOT an exact drop-point detector."
-    echo "  It can provide hop-level evidence only when responses are observable."
-    read -rp "Enable TTL path diagnostic? [y/N]: " _ttl
-    case "$_ttl" in y|Y|yes|YES) TTL_PATH_PROBE=1 ;; *) TTL_PATH_PROBE=0 ;; esac
-    if [ "$TTL_PATH_PROBE" -eq 1 ]; then
+    echo "TTL diagnostics:"
+    echo "  0) Off [default]"
+    echo "  1) Normal TTL baseline"
+    echo "     Sends ordinary (non-spoofed) probes to show normal hop behavior."
+    echo "  2) Receiver-assisted SPOOFED TTL sweep"
+    echo "     Sends spoofed packets with TTL=1..N while the other controlled server captures arrivals."
+    echo "     This proves which initial TTL values actually reach the receiver."
+    echo "  3) Both baseline + receiver-assisted spoofed sweep"
+    echo "Important: if no spoofed TTL reaches the receiver, the filter/drop happened before the"
+    echo "destination, but the exact filtering hop cannot be identified unless the spoofed source"
+    echo "address itself is also controlled and can receive/capture ICMP Time Exceeded responses."
+    read -rp "Select TTL diagnostic [0-3, default 0]: " _ttl
+    case "${_ttl:-0}" in
+        1) TTL_PATH_PROBE=1 ;;
+        2) TTL_PATH_PROBE=2 ;;
+        3) TTL_PATH_PROBE=3 ;;
+        *) TTL_PATH_PROBE=0 ;;
+    esac
+    if [ "$TTL_PATH_PROBE" -ne 0 ]; then
         read -rp "Maximum TTL to test [12]: " _tm
         _tm="${_tm:-12}"
         [[ "$_tm" =~ ^[0-9]+$ ]] && [ "$_tm" -ge 1 ] && [ "$_tm" -le 64 ] && TTL_MAX="$_tm"
@@ -1162,15 +1192,158 @@ configure_test_options() {
 
 ttl_path_diagnostic_local() {
     local target="$1"
-    [ "${TTL_PATH_PROBE:-0}" -eq 1 ] || return 0
+    case "${TTL_PATH_PROBE:-0}" in
+        1|3) ;;
+        *) return 0 ;;
+    esac
     echo
-    echo -e "${CYAN}--- Optional TTL path diagnostic (non-spoofed baseline) ---${NC}"
-    echo -e "${BLUE}[*] This does not identify hypervisor/ToR drop points with certainty.${NC}"
-    echo -e "${BLUE}[*] It records normal hop behavior up to TTL ${TTL_MAX:-12} for comparison.${NC}"
+    echo -e "${CYAN}--- TTL diagnostic: normal non-spoofed baseline ---${NC}"
+    echo -e "${BLUE}[*] Records ordinary hop behavior up to TTL ${TTL_MAX:-12}.${NC}"
     local ttl
     for ttl in $(seq 1 "${TTL_MAX:-12}"); do
         ping -n -c 1 -W 1 -t "$ttl" "$target" 2>&1 | awk -v t="$ttl" '/Time to live exceeded|ttl exceeded|bytes from|From / {print "TTL " t ": " $0; found=1} END{if(!found) print "TTL " t ": no visible response"}'
     done
+}
+
+# Send spoofed packets with a unique IP-ID for each initial TTL while the controlled
+# receiver captures the selected transport. Receiver observation is authoritative:
+# replies to a spoofed source are NOT required.
+spoofed_ttl_send_local() {
+    local target="$1" spoof="$2"
+    local src
+    src="$(spoof_rule_ip)"
+    [ -n "$src" ] || src="$spoof"
+    python3 -u - "$target" "$src" "${TTL_MAX:-12}" "${TEST_TRANSPORT:-icmp}" "${TEST_PORT:-0}" "${PROBE_DELAY_SEC:-0.05}" "${TTL_TAG_BASE:-40000}" <<'PYEOF' || true
+import sys, time
+from scapy.all import IP, ICMP, UDP, TCP, Raw, send
+
+dst, src = sys.argv[1], sys.argv[2]
+max_ttl = int(sys.argv[3])
+transport = sys.argv[4]
+port = int(sys.argv[5])
+delay = float(sys.argv[6])
+base = int(sys.argv[7])
+for ttl in range(1, max_ttl + 1):
+    ip = IP(src=src, dst=dst, ttl=ttl, id=base + ttl)
+    if transport == "udp":
+        pkt = ip/UDP(dport=port)/Raw(("IPSPTTL:%d" % ttl).encode())
+    elif transport == "tcp":
+        pkt = ip/TCP(dport=port, flags="S")/Raw(("IPSPTTL:%d" % ttl).encode())
+    else:
+        pkt = ip/ICMP()/Raw(("IPSPTTL:%d" % ttl).encode())
+    send(pkt, verbose=False)
+    print("SPOOFED_TTL_SENT ttl=%d ipid=%d src=%s dst=%s transport=%s" % (ttl, base+ttl, src, dst, transport))
+    time.sleep(delay)
+PYEOF
+}
+
+spoofed_ttl_send_remote() {
+    local target="$1" spoof="$2"
+    local src rp
+    src="$(spoof_rule_ip)"
+    [ -n "$src" ] || src="$spoof"
+    rp="$(remote_prefix_cmd)"
+    ssh_foreign "
+        ${rp}python3 -u - '$target' '$src' '${TTL_MAX:-12}' '${TEST_TRANSPORT:-icmp}' '${TEST_PORT:-0}' '${PROBE_DELAY_SEC:-0.05}' '${TTL_TAG_BASE:-40000}' <<'PYEOF'
+import sys, time
+from scapy.all import IP, ICMP, UDP, TCP, Raw, send
+
+dst, src = sys.argv[1], sys.argv[2]
+max_ttl = int(sys.argv[3])
+transport = sys.argv[4]
+port = int(sys.argv[5])
+delay = float(sys.argv[6])
+base = int(sys.argv[7])
+for ttl in range(1, max_ttl + 1):
+    ip = IP(src=src, dst=dst, ttl=ttl, id=base + ttl)
+    if transport == 'udp':
+        pkt = ip/UDP(dport=port)/Raw(('IPSPTTL:%d' % ttl).encode())
+    elif transport == 'tcp':
+        pkt = ip/TCP(dport=port, flags='S')/Raw(('IPSPTTL:%d' % ttl).encode())
+    else:
+        pkt = ip/ICMP()/Raw(('IPSPTTL:%d' % ttl).encode())
+    send(pkt, verbose=False)
+    print('SPOOFED_TTL_SENT ttl=%d ipid=%d src=%s dst=%s transport=%s' % (ttl, base+ttl, src, dst, transport))
+    time.sleep(delay)
+PYEOF
+    " || true
+}
+
+report_spoofed_ttl_arrivals() {
+    local logfile="$1" label="$2"
+    local base="${TTL_TAG_BASE:-40000}" max="${TTL_MAX:-12}" ttl id seen first=""
+    echo
+    echo -e "${CYAN}--- Receiver-assisted spoofed TTL results: $label ---${NC}"
+    echo -e "${BLUE}[*] A REACHED result means the receiver actually captured that spoofed probe.${NC}"
+    for ttl in $(seq 1 "$max"); do
+        id=$((base + ttl))
+        seen=$(grep -E -c "id[[:space:]]+$id([,[:space:]]|$)" "$logfile" 2>/dev/null || true)
+        seen="${seen:-0}"
+        if [ "$seen" -gt 0 ]; then
+            [ -z "$first" ] && first="$ttl"
+            printf "  TTL %-3s : REACHED receiver (%s capture%s)\n" "$ttl" "$seen" "$([ "$seen" -eq 1 ] && echo "" || echo "s")"
+        else
+            printf "  TTL %-3s : NOT SEEN at receiver\n" "$ttl"
+        fi
+    done
+    if [ -n "$first" ]; then
+        echo -e "${GREEN}[+] First initial TTL observed at receiver: $first${NC}"
+        echo -e "${BLUE}    This is receiver-side arrival evidence, not proof that a specific router/ToR/hypervisor filtered lower TTLs.${NC}"
+    else
+        echo -e "${YELLOW}[!] No spoofed TTL probe reached the receiver up to TTL $max.${NC}"
+        echo -e "${YELLOW}    The packet was filtered/dropped or expired before the destination; this alone cannot identify the exact filtering hop.${NC}"
+    fi
+}
+
+spoofed_ttl_probe_direct() {
+    case "${TTL_PATH_PROBE:-0}" in 2|3) ;; *) return 0 ;; esac
+    local target="$FOREIGN_IP" src iface filter log pid rp cap_to
+    src="$(spoof_rule_ip)"
+    iface="$(remote_capture_iface "$LOCAL_IP")"; iface="${iface:-any}"
+    filter="($(transport_bpf)) and src host $src"
+    log="/tmp/ttl_direct_$$.log"
+    rp="$(remote_prefix_cmd)"
+    cap_to=$(( ${TTL_MAX:-12} + 8 ))
+    echo
+    echo -e "${CYAN}--- Receiver-assisted SPOOFED TTL sweep: Local -> Foreign ---${NC}"
+    echo -e "${BLUE}[*] Receiver capture: $iface | $filter${NC}"
+    ssh_exec "${rp}timeout ${cap_to} tcpdump -nn -vvv -l -i '$iface' '$filter'" >"$log" 2>&1 &
+    pid=$!
+    if ! wait_for_tcpdump_ready "$log"; then
+        echo -e "${YELLOW}[!] TTL receiver capture did not become ready; skipping spoofed TTL sweep.${NC}"
+        kill "$pid" 2>/dev/null || true
+        return 0
+    fi
+    spoofed_ttl_send_local "$target" "$SPOOF_IP"
+    sleep 2
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+    report_spoofed_ttl_arrivals "$log" "Local -> Foreign / ${TEST_TRANSPORT^^}"
+    [ "${DEBUG:-0}" -eq 0 ] && rm -f "$log" 2>/dev/null || echo -e "${BLUE}[*] TTL capture kept: $log${NC}"
+}
+
+spoofed_ttl_probe_reverse() {
+    case "${TTL_PATH_PROBE:-0}" in 2|3) ;; *) return 0 ;; esac
+    local target="$LOCAL_IP" src iface filter log pid cap_to
+    src="$(spoof_rule_ip)"
+    iface="$(capture_iface_local "$FOREIGN_IP")"; iface="${iface:-any}"
+    filter="($(transport_bpf)) and src host $src"
+    log="/tmp/ttl_reverse_$$.log"
+    cap_to=$(( ${TTL_MAX:-12} + 8 ))
+    echo
+    echo -e "${CYAN}--- Receiver-assisted SPOOFED TTL sweep: Foreign -> Local ---${NC}"
+    echo -e "${BLUE}[*] Receiver capture: $iface | $filter${NC}"
+    timeout "$cap_to" tcpdump -nn -vvv -l -i "$iface" "$filter" >"$log" 2>&1 &
+    pid=$!
+    if ! wait_for_tcpdump_ready "$log"; then
+        echo -e "${YELLOW}[!] TTL receiver capture did not become ready; skipping spoofed TTL sweep.${NC}"
+        kill "$pid" 2>/dev/null || true
+        return 0
+    fi
+    spoofed_ttl_send_remote "$target" "$SPOOF_IP"
+    sleep 2
+    kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+    report_spoofed_ttl_arrivals "$log" "Foreign -> Local / ${TEST_TRANSPORT^^}"
+    [ "${DEBUG:-0}" -eq 0 ] && rm -f "$log" 2>/dev/null || echo -e "${BLUE}[*] TTL capture kept: $log${NC}"
 }
 
 ssh_foreign() {
@@ -1296,6 +1469,12 @@ ensure_scapy_local() {
 check_nping_proof() {
     local nping_log="$1"
     local spoof="$2"
+    # nping reply proof in this script is ICMP-specific. Never use an ICMP
+    # reply as proof for a UDP or TCP transport result; those modes are proven
+    # only by the matching tcpdump capture on the receiver.
+    if [ "${TEST_TRANSPORT:-icmp}" != "icmp" ]; then
+        return 1
+    fi
     if [ -f "$nping_log" ] && grep -q "RCVD" "$nping_log" 2>/dev/null && grep -q "Echo reply" "$nping_log" 2>/dev/null; then
         echo -e "${GREEN}[+] PROOF: target replied to spoofed source ($spoof) - spoofed packet ARRIVED (see RCVD line above).${NC}"
         echo "SPOOF_PROVEN_BY_REPLY" >> "$nping_log"
@@ -2250,11 +2429,22 @@ auto_test() {
     fi
     echo "Test Mode        : $([ "$TEST_DIR" -eq 1 ] && echo "Both (Direct + Reverse)" || ([ "$TEST_DIR" -eq 2 ] && echo "Direct Only" || echo "Reverse Only"))"
     echo "RAW Transport    : $TEST_TRANSPORT"
-    [ "$TEST_TRANSPORT" != "icmp" ] && echo "Transport port   : $TEST_PORT"
+    if [ "$TEST_TRANSPORT" = "all" ]; then
+        echo "UDP port         : $UDP_TEST_PORT"
+        echo "TCP port         : $TCP_TEST_PORT"
+    elif [ "$TEST_TRANSPORT" != "icmp" ]; then
+        echo "Transport port   : $TEST_PORT"
+    fi
     echo "Probe delay      : ${PROBE_DELAY_SEC}s"
     echo "Capture interface: $CAPTURE_INTERFACE"
     echo "SSH auth         : $SSH_AUTH_MODE"
-    echo "TTL diagnostic   : $([ "$TTL_PATH_PROBE" -eq 1 ] && echo "enabled (max $TTL_MAX)" || echo "disabled")"
+    case "$TTL_PATH_PROBE" in
+        1) _ttl_label="normal baseline (max $TTL_MAX)" ;;
+        2) _ttl_label="receiver-assisted spoofed sweep (max $TTL_MAX)" ;;
+        3) _ttl_label="baseline + receiver-assisted spoofed sweep (max $TTL_MAX)" ;;
+        *) _ttl_label="disabled" ;;
+    esac
+    echo "TTL diagnostic   : $_ttl_label"
     echo "Output files     : ./spoof_summary.csv + ./spoof_full.csv (overwritten, appended per target)"
     echo "--------------------------------------"
     echo
@@ -2323,7 +2513,7 @@ auto_test() {
         SPOOF_CIDR=""; SPOOF_REP_IP=""; SPOOF_FILTER=""
         if ! normalize_spoof_input "$_entry"; then
             echo -e "${YELLOW}[!] Skipping invalid target: $_entry${NC}"
-            _batch_summary+=("$_entry | SKIPPED (bad input) | SKIPPED (bad input)")
+            _batch_summary+=("$_entry | N/A | SKIPPED (bad input) | SKIPPED (bad input)")
             continue
         fi
         # Per-target sample size: single IP -> 1; CIDR -> GLOBAL_CIDR_N (or ALL->host count)
@@ -2346,49 +2536,78 @@ auto_test() {
         RAW_PKTS_PER_IP=5
         echo -e "${BLUE}[*] Samples for $_entry: $CIDR_SAMPLE_MAX IP(s)${NC}"
 
-        direct_res="SKIPPED"
-        reverse_res="SKIPPED"
-        direct_spoof_cnt=0; reverse_spoof_cnt=0
-        direct_new_real=0; reverse_new_real=0
-        direct_nping_proven=0; reverse_nping_proven=0
-        direct_raw_ran=0; reverse_raw_ran=0
-        DIRECT_RX_LOG=""; REVERSE_RX_LOG=""
-        DIRECT_NPING_LOG=""; REVERSE_NPING_LOG=""
+        local _selected_transport="$TEST_TRANSPORT"
+        local -a _transport_runs
+        if [ "$_selected_transport" = "all" ]; then
+            _transport_runs=(icmp udp tcp)
+        else
+            _transport_runs=("$_selected_transport")
+        fi
 
-        case "$TEST_DIR" in
-            1)
-                direct_test
-                reverse_test
-                ;;
-            2)
-                direct_test
-                ;;
-            3)
-                reverse_test
-                ;;
-            *)
-                direct_test
-                reverse_test
-                ;;
-        esac
+        local _run_transport
+        for _run_transport in "${_transport_runs[@]}"; do
+            TEST_TRANSPORT="$_run_transport"
+            case "$TEST_TRANSPORT" in
+                udp) TEST_PORT="$UDP_TEST_PORT" ;;
+                tcp) TEST_PORT="$TCP_TEST_PORT" ;;
+                *) TEST_PORT="0" ;;
+            esac
 
-        print_summary "$direct_res" "$reverse_res"
-        write_csv_results || true
-        CSV_APPEND=1
-        _batch_summary+=("$_entry | $direct_res | $reverse_res")
+            echo
+            echo "----------------------------------------------------------------------"
+            echo "   TRANSPORT TEST: ${TEST_TRANSPORT^^}$([ "$TEST_TRANSPORT" != "icmp" ] && echo " (destination port $TEST_PORT)")"
+            echo "----------------------------------------------------------------------"
+            if [ "$TEST_TRANSPORT" = "tcp" ]; then
+                echo "TCP proof: destination-side capture of the spoofed SYN is authoritative."
+                echo "A SYN-ACK reply is not required because replies are routed to the spoofed source."
+            fi
+
+            direct_res="SKIPPED"
+            reverse_res="SKIPPED"
+            direct_spoof_cnt=0; reverse_spoof_cnt=0
+            direct_new_real=0; reverse_new_real=0
+            direct_nping_proven=0; reverse_nping_proven=0
+            direct_raw_ran=0; reverse_raw_ran=0
+            DIRECT_RX_LOG=""; REVERSE_RX_LOG=""
+            DIRECT_NPING_LOG=""; REVERSE_NPING_LOG=""
+
+            # Optional receiver-assisted spoofed TTL sweep uses the same selected transport.
+            case "$TEST_DIR" in
+                1) spoofed_ttl_probe_direct; spoofed_ttl_probe_reverse ;;
+                2) spoofed_ttl_probe_direct ;;
+                3) spoofed_ttl_probe_reverse ;;
+                *) spoofed_ttl_probe_direct; spoofed_ttl_probe_reverse ;;
+            esac
+
+            case "$TEST_DIR" in
+                1) direct_test; reverse_test ;;
+                2) direct_test ;;
+                3) reverse_test ;;
+                *) direct_test; reverse_test ;;
+            esac
+
+            echo "Transport: ${TEST_TRANSPORT^^}"
+            print_summary "$direct_res" "$reverse_res"
+            write_csv_results || true
+            CSV_APPEND=1
+            _batch_summary+=("$_entry | ${TEST_TRANSPORT^^} | $direct_res | $reverse_res")
+        done
+        TEST_TRANSPORT="$_selected_transport"
     done
 
     echo
     echo "======================================================================"
     echo "   BATCH SUMMARY (${#SPOOF_TARGETS[@]} target(s))"
     echo "======================================================================"
-    printf "%-32s | %-24s | %-24s\n" "SPOOF TARGET" "DIRECT" "REVERSE"
-    echo "----------------------------------------------------------------------"
-    local _row _t _d _r _rest
+    printf "%-30s | %-9s | %-24s | %-24s\n" "SPOOF TARGET" "TRANSPORT" "DIRECT" "REVERSE"
+    echo "------------------------------------------------------------------------------------------------"
+    local _row _t _trn _d _r _rest
     if [ "${#_batch_summary[@]}" -gt 0 ]; then
     for _row in "${_batch_summary[@]}"; do
-        _t="${_row%% | *}"; _rest="${_row#* | }"; _d="${_rest%% | *}"; _r="${_rest#* | }"
-        printf "%-32s | %-24s | %-24s\n" "$_t" "$_d" "$_r"
+        _t="${_row%% | *}"; _rest="${_row#* | }"
+        _trn="${_rest%% | *}"; _rest="${_rest#* | }"
+        _d="${_rest%% | *}"; _r="${_rest#* | }"
+        printf "%-30s | %-9s | %-24s | %-24s\n" "$_t" "$_trn" "$_d" "$_r"
     done
     fi
     echo "======================================================================"
