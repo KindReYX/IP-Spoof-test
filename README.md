@@ -1048,7 +1048,216 @@ IP-Spoof-test/
 
 ---
 
+
+---
+
+# Advanced Test Options (v2)
+
+After you start **Automated Test**, the script now shows an **Advanced Test Options** menu before the test begins.
+
+These options are designed for authorized lab testing and use conservative defaults.
+
+## 1. Transport selection
+
+You can select the transport used by the spoofed RAW probe:
+
+```text
+1) ICMP [default]
+2) UDP
+3) TCP
+```
+
+### ICMP
+
+Uses an ICMP Echo probe and is the most compatible mode with the original version of the tool.
+
+### UDP
+
+Sends a UDP probe to a destination port that you choose. The default test port is:
+
+```text
+33434
+```
+
+### TCP
+
+Sends a TCP SYN probe to a destination port that you choose. The default test port is:
+
+```text
+443
+```
+
+> The normal non-spoofed connectivity baseline remains ICMP in every mode. The selected transport applies to the spoofed RAW probe so results can be compared across ICMP, UDP, and TCP without claiming that one protocol represents all protocols.
+
+---
+
+## 2. Probe rate
+
+The script no longer uses an unlimited `inter=0` burst for full-range mode.
+
+Available profiles:
+
+```text
+1) Safe [default]  -> 50ms delay
+2) Gentle          -> 100ms delay
+3) Fast (opt-in)   -> 5ms delay
+```
+
+### Safe
+
+Recommended for normal educational and authorized testing.
+
+```text
+50ms between packets
+```
+
+### Gentle
+
+Uses a lower packet rate when you want to reduce test traffic further.
+
+```text
+100ms between packets
+```
+
+### Fast
+
+Explicit opt-in mode for controlled environments only.
+
+```text
+5ms between packets
+```
+
+Fast mode is still rate-limited and does **not** use an unlimited zero-delay burst.
+
+---
+
+## 3. Capture interface selection
+
+The script can automatically determine the interface used for the route to the peer server.
+
+Options:
+
+```text
+auto     -> recommended/default
+any      -> capture on every interface
+eth0     -> example explicit interface
+ens3     -> example explicit interface
+```
+
+### `auto`
+
+Uses:
+
+```bash
+ip route get <peer-ip>
+```
+
+to detect the route interface.
+
+This is recommended on Docker/veth/container hosts because `tcpdump -i any` may observe the same packet on multiple interfaces and make raw packet counts misleading.
+
+### `any`
+
+Still available when you intentionally want a host-wide capture.
+
+---
+
+## 4. SSH authentication
+
+Automated mode now offers:
+
+```text
+1) SSH key / ssh-agent [recommended, default]
+2) Password via sshpass [fallback]
+```
+
+### SSH key / ssh-agent
+
+Recommended mode. Configure SSH access normally before running the test, for example:
+
+```bash
+ssh-copy-id root@203.0.113.10
+ssh root@203.0.113.10
+```
+
+The script then uses your normal SSH key or agent.
+
+Host-key handling uses `StrictHostKeyChecking=accept-new`, so an existing changed host key is not silently ignored.
+
+### Password fallback
+
+If key authentication is not available, select password mode. The password is requested interactively and `sshpass` is used only as the fallback method.
+
+> SSH keys are strongly recommended for rented servers, automation, and repeat testing.
+
+---
+
+## 5. Optional TTL path diagnostic
+
+The Advanced Options menu can enable an optional TTL diagnostic.
+
+Example:
+
+```text
+Enable TTL path diagnostic? [y/N]: y
+Maximum TTL to test [12]: 12
+```
+
+The diagnostic sends a normal, **non-spoofed** ICMP baseline with increasing TTL values and records visible hop responses.
+
+It is useful for teaching and comparing normal path behavior, but it is intentionally described as a diagnostic rather than an exact drop-point detector.
+
+It **cannot reliably prove** that a spoofed packet was dropped specifically by a host, hypervisor, ToR switch, or a particular transit device. Some layers are not visible IP hops, and ICMP Time Exceeded responses may be filtered or returned to a different source address.
+
+Use the output as hop-level evidence only.
+
+---
+
+## Example Advanced Options session
+
+```text
+======================================================
+                 ADVANCED TEST OPTIONS
+======================================================
+These options change how the authorized test is performed.
+Safe, low-rate defaults are recommended for normal use.
+
+Transport for spoofed RAW probe:
+  1) ICMP [default]
+  2) UDP
+  3) TCP
+Select transport [1-3, default 1]: 2
+Destination port for udp [33434]: 33434
+
+Probe rate:
+  1) Safe [default] - 50ms delay between packets
+  2) Gentle         - 100ms delay
+  3) Fast (opt-in)  - 5ms delay
+Select rate [1-3, default 1]: 1
+
+Capture interface:
+  auto [default]
+  any
+  <interface name>
+Capture interface [auto]: auto
+
+Optional TTL path diagnostic:
+Enable TTL path diagnostic? [y/N]: n
+======================================================
+```
+
+
 # License
+
+قبل از Public کردن Repository بهتر است یک License مشخص انتخاب کنید.
+
+برای پروژه‌های Open Source معمولاً یکی از این موارد استفاده می‌شود:
+
+- MIT
+- Apache-2.0
+- GPL-3.0
+
+اگر License انتخاب نشده، بهتر است فایل `LICENSE` به Repository اضافه شود.
 
 ---
 

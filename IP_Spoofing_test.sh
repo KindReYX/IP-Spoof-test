@@ -37,6 +37,17 @@ FOREIGN_USER="root"
 FOREIGN_PASS=""
 LOCAL_IP=""
 
+# ---- v2 safe/advanced test options ----
+TEST_TRANSPORT="icmp"       # icmp | udp | tcp (RAW spoof probe transport)
+TEST_PORT="33434"           # used for UDP/TCP probes
+PROBE_DELAY_SEC="0.05"      # safe default: 50ms between packets
+NPING_DELAY_MS="50"
+FAST_MODE=0
+CAPTURE_INTERFACE="auto"    # auto or explicit interface name
+SSH_AUTH_MODE="key"         # key | password
+TTL_PATH_PROBE=0             # optional educational path diagnostic
+TTL_MAX=12
+
 # ---- CSV + per-IP tracking ----
 CIDR_SAMPLE_MAX=3
 # Fast full-range mode: above this many sample IPs we switch to single-SSH
@@ -798,23 +809,15 @@ cleanup() {
         echo -e "${GREEN}[+] Local rule removed.${NC}"
     fi
 
-    if [ "$REMOTE_RULE_ADDED" -eq 1 ] && [ -n "${FOREIGN_IP:-}" ] && [ -n "${FOREIGN_PASS:-}" ] && [ -n "${LOCAL_IP:-}" ] && [ -n "${SPOOF_IP:-}" ]; then
+    if [ "$REMOTE_RULE_ADDED" -eq 1 ] && [ -n "${FOREIGN_IP:-}" ] && [ -n "${LOCAL_IP:-}" ] && [ -n "${SPOOF_IP:-}" ]; then
         echo
         echo -e "${YELLOW}[*] Removing remote iptables rule on Foreign server...${NC}"
 
-        local remote_prefix=""
-        if [ "${FOREIGN_USER:-root}" != "root" ]; then
-            remote_prefix="echo '$FOREIGN_PASS' | sudo -S "
-        fi
+        local remote_prefix
+        remote_prefix="$(remote_prefix_cmd)"
         local _rep="${SPOOF_REP_IP:-${SPOOF_IP:-}}"
 
-        sshpass -p "$FOREIGN_PASS" ssh -p "${FOREIGN_PORT:-22}" \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o ConnectTimeout=5 \
-            -o LogLevel=ERROR \
-            "${FOREIGN_USER:-root}@$FOREIGN_IP" \
-            "${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -d '$LOCAL_IP' -j SNAT --to-source '$_rep' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -j SNAT --to-source '$_rep' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -d '$LOCAL_IP' -j SNAT --to-source '$SPOOF_IP' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -j SNAT --to-source '$SPOOF_IP' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -s '$SPOOF_IP' -j ACCEPT 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -s '$_rep' -j ACCEPT 2>/dev/null || true; ${remote_prefix}nft delete table ip spoof_test 2>/dev/null || true" 2>/dev/null || true
+        ssh_exec "${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -d '$LOCAL_IP' -j SNAT --to-source '$_rep' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -j SNAT --to-source '$_rep' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -d '$LOCAL_IP' -j SNAT --to-source '$SPOOF_IP' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -p icmp -j SNAT --to-source '$SPOOF_IP' 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -s '$SPOOF_IP' -j ACCEPT 2>/dev/null || true; ${remote_prefix}iptables -t nat -D POSTROUTING -s '$_rep' -j ACCEPT 2>/dev/null || true; ${remote_prefix}nft delete table ip spoof_test 2>/dev/null || true" 2>/dev/null || true
 
         REMOTE_RULE_ADDED=0
         echo -e "${GREEN}[+] Remote rule removed.${NC}"
@@ -1053,19 +1056,135 @@ wait_for_tcpdump_ready() {
     return 1
 }
 
+transport_bpf() {
+    case "${TEST_TRANSPORT:-icmp}" in
+        udp) echo "udp and dst port ${TEST_PORT:-33434}" ;;
+        tcp) echo "tcp and dst port ${TEST_PORT:-443}" ;;
+        *)   echo "icmp" ;;
+    esac
+}
+
+capture_iface_local() {
+    local target="$1"
+    if [ "${CAPTURE_INTERFACE:-auto}" != "auto" ]; then
+        echo "$CAPTURE_INTERFACE"
+        return 0
+    fi
+    ip route get "$target" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+}
+
+ssh_exec() {
+    local remote_cmd="$1"
+    local -a opts=(
+        -p "${FOREIGN_PORT:-22}"
+        -o ConnectTimeout=10
+        -o LogLevel=ERROR
+    )
+    if [ "${SSH_AUTH_MODE:-key}" = "password" ]; then
+        opts+=( -o StrictHostKeyChecking=accept-new )
+        sshpass -p "$FOREIGN_PASS" ssh "${opts[@]}" "$FOREIGN_USER@$FOREIGN_IP" "$remote_cmd"
+    else
+        opts+=( -o BatchMode=yes -o StrictHostKeyChecking=accept-new )
+        ssh "${opts[@]}" "$FOREIGN_USER@$FOREIGN_IP" "$remote_cmd"
+    fi
+}
+
+remote_capture_iface() {
+    local target="$1"
+    if [ "${CAPTURE_INTERFACE:-auto}" != "auto" ]; then
+        echo "$CAPTURE_INTERFACE"
+        return 0
+    fi
+    ssh_exec "ip route get '$target' 2>/dev/null | awk '{for(i=1;i<=NF;i++) if(\$i==\"dev\") {print \$(i+1); exit}}'" 2>/dev/null
+}
+
+configure_test_options() {
+    echo
+    echo "======================================================"
+    echo "                 ADVANCED TEST OPTIONS"
+    echo "======================================================"
+    echo "These options change how the authorized test is performed."
+    echo "Safe, low-rate defaults are recommended for normal use."
+    echo
+    echo "Transport for spoofed RAW probe:"
+    echo "  1) ICMP [default] - ICMP Echo probe; best compatibility with the original test."
+    echo "  2) UDP           - Sends a UDP probe to a controlled destination port."
+    echo "  3) TCP           - Sends a TCP SYN probe to a controlled destination port."
+    echo "Note: the non-spoofed connectivity baseline remains ICMP for all modes."
+    read -rp "Select transport [1-3, default 1]: " _tr
+    case "${_tr:-1}" in
+        2) TEST_TRANSPORT="udp"; TEST_PORT="33434" ;;
+        3) TEST_TRANSPORT="tcp"; TEST_PORT="443" ;;
+        *) TEST_TRANSPORT="icmp" ;;
+    esac
+    if [ "$TEST_TRANSPORT" != "icmp" ]; then
+        read -rp "Destination port for $TEST_TRANSPORT [${TEST_PORT}]: " _port
+        _port="${_port:-$TEST_PORT}"
+        if [[ "$_port" =~ ^[0-9]+$ ]] && [ "$_port" -ge 1 ] && [ "$_port" -le 65535 ]; then
+            TEST_PORT="$_port"
+        fi
+    fi
+
+    echo
+    echo "Probe rate:"
+    echo "  1) Safe [default] - 50ms delay between packets; recommended for education/testing."
+    echo "  2) Gentle         - 100ms delay; lower packet rate."
+    echo "  3) Fast (opt-in)  - 5ms delay; may trigger provider rate/abuse controls."
+    read -rp "Select rate [1-3, default 1]: " _rate
+    case "${_rate:-1}" in
+        2) PROBE_DELAY_SEC="0.10"; NPING_DELAY_MS="100"; FAST_MODE=0 ;;
+        3) PROBE_DELAY_SEC="0.005"; NPING_DELAY_MS="5"; FAST_MODE=1 ;;
+        *) PROBE_DELAY_SEC="0.05"; NPING_DELAY_MS="50"; FAST_MODE=0 ;;
+    esac
+
+    echo
+    echo "Capture interface:"
+    echo "  auto [default] - Detect the egress interface using 'ip route get'."
+    echo "  any            - Capture on all interfaces (can duplicate packets on Docker/veth hosts)."
+    echo "  <name>         - Explicit interface, e.g. eth0 or ens3."
+    read -rp "Capture interface [auto]: " _iface
+    CAPTURE_INTERFACE="${_iface:-auto}"
+
+    echo
+    echo "Optional TTL path diagnostic:"
+    echo "  This is an educational path probe, NOT an exact drop-point detector."
+    echo "  It can provide hop-level evidence only when responses are observable."
+    read -rp "Enable TTL path diagnostic? [y/N]: " _ttl
+    case "$_ttl" in y|Y|yes|YES) TTL_PATH_PROBE=1 ;; *) TTL_PATH_PROBE=0 ;; esac
+    if [ "$TTL_PATH_PROBE" -eq 1 ]; then
+        read -rp "Maximum TTL to test [12]: " _tm
+        _tm="${_tm:-12}"
+        [[ "$_tm" =~ ^[0-9]+$ ]] && [ "$_tm" -ge 1 ] && [ "$_tm" -le 64 ] && TTL_MAX="$_tm"
+    fi
+
+    echo "======================================================"
+}
+
+ttl_path_diagnostic_local() {
+    local target="$1"
+    [ "${TTL_PATH_PROBE:-0}" -eq 1 ] || return 0
+    echo
+    echo -e "${CYAN}--- Optional TTL path diagnostic (non-spoofed baseline) ---${NC}"
+    echo -e "${BLUE}[*] This does not identify hypervisor/ToR drop points with certainty.${NC}"
+    echo -e "${BLUE}[*] It records normal hop behavior up to TTL ${TTL_MAX:-12} for comparison.${NC}"
+    local ttl
+    for ttl in $(seq 1 "${TTL_MAX:-12}"); do
+        ping -n -c 1 -W 1 -t "$ttl" "$target" 2>&1 | awk -v t="$ttl" '/Time to live exceeded|ttl exceeded|bytes from|From / {print "TTL " t ": " $0; found=1} END{if(!found) print "TTL " t ": no visible response"}'
+    done
+}
+
 ssh_foreign() {
     dbg_log "SSH>> $*"
-    sshpass -p "$FOREIGN_PASS" ssh -p "$FOREIGN_PORT" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        "$FOREIGN_USER@$FOREIGN_IP" "$@"
+    ssh_exec "$*"
 }
 
 remote_prefix_cmd() {
     if [ "${FOREIGN_USER:-root}" != "root" ]; then
-        echo "echo '$FOREIGN_PASS' | sudo -S "
+        if [ "${SSH_AUTH_MODE:-key}" = "password" ]; then
+            echo "echo '$FOREIGN_PASS' | sudo -S "
+        else
+            echo "sudo -n "
+        fi
     else
         echo ""
     fi
@@ -1275,17 +1394,26 @@ remote_raw_spoof() {
         local ip_args
         ip_args="$(printf " '%s'" "${spoof_list[@]}")"
         ssh_foreign "
-            ${rp}python3 -u - '$target' '$PKTS' $ip_args <<'PYEOF' 2>&1
+            ${rp}python3 -u - '$target' '$PKTS' '$TEST_TRANSPORT' '$TEST_PORT' '$PROBE_DELAY_SEC' $ip_args <<'PYEOF' 2>&1
 import sys
 try:
-    from scapy.all import IP, ICMP, send
+    from scapy.all import IP, ICMP, UDP, TCP, Raw, send
     dst = sys.argv[1]
     per = int(sys.argv[2])
-    srcs = sys.argv[3:]
+    transport = sys.argv[3]
+    port = int(sys.argv[4])
+    delay = float(sys.argv[5])
+    srcs = sys.argv[6:]
+    def make_pkt(src):
+        if transport == "udp":
+            return IP(src=src, dst=dst)/UDP(dport=port)/Raw(b"IP-SPOOF-TEST")
+        if transport == "tcp":
+            return IP(src=src, dst=dst)/TCP(dport=port, flags="S")
+        return IP(src=src, dst=dst)/ICMP()
     ok = 0
     for src in srcs:
-        pkt = IP(src=src, dst=dst)/ICMP()
-        send(pkt, count=per, inter=0.2, verbose=False)
+        pkt = make_pkt(src)
+        send(pkt, count=per, inter=delay, verbose=False)
         print('RAW_SPOOF_SENT (scapy src=%s x%d)' % (src, per))
         ok += 1
     print('RAW_SPOOF_BATCH_DONE scapy=%d' % ok)
@@ -1310,18 +1438,27 @@ PYEOF
         local rep
         rep="$(spoof_rule_ip)"
         [ -n "$rep" ] || rep="$spoof"
-        echo -e "${BLUE}[*] FULL-RANGE fast mode: scapy covers $sample_n IPs in ONE remote python (inter=0, no per-IP SSH).${NC}"
+        echo -e "${BLUE}[*] FULL-RANGE fast mode: scapy covers $sample_n IPs in ONE remote python (rate-limited, no per-IP SSH).${NC}"
         echo -e "${BLUE}[*] nping proof runs on rep IP $rep only (1 SSH). Per-IP proof comes from tcpdump.${NC}"
         ssh_foreign "
-            ${rp}python3 -u - '$target' '$spoof' '$sample_n' '$PKTS' <<'PYEOF' 2>&1
+            ${rp}python3 -u - '$target' '$spoof' '$sample_n' '$PKTS' '$TEST_TRANSPORT' '$TEST_PORT' '$PROBE_DELAY_SEC' <<'PYEOF' 2>&1
 import sys, ipaddress
 try:
-    from scapy.all import IP, ICMP, send
+    from scapy.all import IP, ICMP, UDP, TCP, Raw, send
     dst = sys.argv[1]
     cidr = sys.argv[2]
     want = int(sys.argv[3])
     per = int(sys.argv[4])
+    transport = sys.argv[5]
+    port = int(sys.argv[6])
+    delay = float(sys.argv[7])
     net = ipaddress.ip_network(cidr, strict=False)
+    def make_pkt(src):
+        if transport == "udp":
+            return IP(src=src, dst=dst)/UDP(dport=port)/Raw(b"IP-SPOOF-TEST")
+        if transport == "tcp":
+            return IP(src=src, dst=dst)/TCP(dport=port, flags="S")
+        return IP(src=src, dst=dst)/ICMP()
     total = net.num_addresses
     if total <= 2:
         srcs = [str(net.network_address)]
@@ -1333,16 +1470,16 @@ try:
         done = 0
         for i in range(1, n + 1):
             src = str(ipaddress.ip_address(base + i))
-            pkt = IP(src=src, dst=dst)/ICMP()
-            send(pkt, count=per, inter=0, verbose=False)
+            pkt = make_pkt(src)
+            send(pkt, count=per, inter=delay, verbose=False)
             done += 1
             if done % 2000 == 0:
                 print('RAW_PROGRESS scapy %d/%d' % (done, n))
         print('RAW_SPOOF_BATCH_DONE scapy=%d x%d cidr=%s' % (done, per, cidr))
         sys.exit(0)
     # single-IP CIDR edge (/32): fall through
-    pkt = IP(src=str(net.network_address), dst=dst)/ICMP()
-    send(pkt, count=per, inter=0, verbose=False)
+    pkt = make_pkt(str(net.network_address))
+    send(pkt, count=per, inter=delay, verbose=False)
     print('RAW_SPOOF_BATCH_DONE scapy=1')
 except Exception as e:
     print('RAW_SPOOF_FAIL (scapy): %s' % e)
@@ -1352,12 +1489,12 @@ PYEOF
         rm -f "$nping_log"
         ssh_foreign "
             command -v nping >/dev/null 2>&1 || { echo 'nping missing, skipping Phase 2b'; exit 0; }
-            ${rp}nping --icmp -c $PKTS --delay 200ms --source-ip '$rep' '$target' 2>&1
+            ${rp}nping $([ "$TEST_TRANSPORT" = "udp" ] && echo "--udp -p $TEST_PORT" || ([ "$TEST_TRANSPORT" = "tcp" ] && echo "--tcp -p $TEST_PORT --flags syn" || echo "--icmp")) -c $PKTS --delay ${NPING_DELAY_MS}ms --source-ip '$rep' '$target' 2>&1
             echo 'RAW_SPOOF_SENT (nping src=$rep)'
         " >> "$nping_log" 2>&1 || true
         tail -30 "$nping_log" 2>/dev/null || true
     fi
-    check_nping_proof "$nping_log" "$spoof" || true
+    [ "$TEST_TRANSPORT" = "icmp" ] && check_nping_proof "$nping_log" "$spoof" || true
 }
 
 local_raw_spoof() {
@@ -1391,17 +1528,26 @@ local_raw_spoof() {
             echo -e "${BLUE}[*] CIDR $spoof -> RAW spoofing sample IPs (${#spoof_list[@]}): ${spoof_list[*]:0:10}$([ "${#spoof_list[@]}" -gt 10 ] && echo " ...")${NC}"
         fi
         if [ "$_have_scapy" -eq 1 ]; then
-            python3 -u - "$target" "$PKTS" "${spoof_list[@]}" <<'PYEOF' || true
+            python3 -u - "$target" "$PKTS" "$TEST_TRANSPORT" "$TEST_PORT" "$PROBE_DELAY_SEC" "${spoof_list[@]}" <<'PYEOF' || true
 import sys
 try:
-    from scapy.all import IP, ICMP, send
+    from scapy.all import IP, ICMP, UDP, TCP, Raw, send
     dst = sys.argv[1]
     per = int(sys.argv[2])
-    srcs = sys.argv[3:]
+    transport = sys.argv[3]
+    port = int(sys.argv[4])
+    delay = float(sys.argv[5])
+    srcs = sys.argv[6:]
+    def make_pkt(src):
+        if transport == "udp":
+            return IP(src=src, dst=dst)/UDP(dport=port)/Raw(b"IP-SPOOF-TEST")
+        if transport == "tcp":
+            return IP(src=src, dst=dst)/TCP(dport=port, flags="S")
+        return IP(src=src, dst=dst)/ICMP()
     ok = 0
     for src in srcs:
-        pkt = IP(src=src, dst=dst)/ICMP()
-        send(pkt, count=per, inter=0.2, verbose=False)
+        pkt = make_pkt(src)
+        send(pkt, count=per, inter=delay, verbose=False)
         print('RAW_SPOOF_SENT (scapy src=%s x%d)' % (src, per))
         ok += 1
     print('RAW_SPOOF_BATCH_DONE scapy=%d' % ok)
@@ -1414,11 +1560,11 @@ PYEOF
         if command -v nping >/dev/null 2>&1; then
             local _src
             for _src in "${spoof_list[@]}"; do
-                nping --icmp -c "$PKTS" --delay 200ms --source-ip "$_src" "$target" >> "$nping_log" 2>&1 || true
+                nping $([ "$TEST_TRANSPORT" = "udp" ] && echo "--udp -p $TEST_PORT" || ([ "$TEST_TRANSPORT" = "tcp" ] && echo "--tcp -p $TEST_PORT --flags syn" || echo "--icmp")) -c "$PKTS" --delay "${NPING_DELAY_MS}ms" --source-ip "$_src" "$target" >> "$nping_log" 2>&1 || true
                 echo "RAW_SPOOF_SENT (nping src=$_src)"
             done
             tail -30 "$nping_log"
-            check_nping_proof "$nping_log" "$spoof" || true
+            [ "$TEST_TRANSPORT" = "icmp" ] && check_nping_proof "$nping_log" "$spoof" || true
         else
             echo "(nping missing locally, skipping)"
         fi
@@ -1428,22 +1574,31 @@ PYEOF
         rep="$(spoof_rule_ip)"
         [ -n "$rep" ] || rep="$spoof"
         if [[ "$spoof" == *"/"* ]]; then
-            echo -e "${BLUE}[*] FULL-RANGE fast mode: scapy covers $sample_n IPs in ONE python (inter=0).${NC}"
+            echo -e "${BLUE}[*] FULL-RANGE fast mode: scapy covers $sample_n IPs in ONE python (rate-limited).${NC}"
         fi
         if [ "$_have_scapy" -eq 1 ]; then
-            python3 -u - "$target" "$spoof" "$sample_n" "$PKTS" <<'PYEOF' || true
+            python3 -u - "$target" "$spoof" "$sample_n" "$PKTS" "$TEST_TRANSPORT" "$TEST_PORT" "$PROBE_DELAY_SEC" <<'PYEOF' || true
 import sys, ipaddress
 try:
-    from scapy.all import IP, ICMP, send
+    from scapy.all import IP, ICMP, UDP, TCP, Raw, send
     dst = sys.argv[1]
     cidr = sys.argv[2]
     want = int(sys.argv[3])
     per = int(sys.argv[4])
+    transport = sys.argv[5]
+    port = int(sys.argv[6])
+    delay = float(sys.argv[7])
     net = ipaddress.ip_network(cidr, strict=False)
+    def make_pkt(src):
+        if transport == "udp":
+            return IP(src=src, dst=dst)/UDP(dport=port)/Raw(b"IP-SPOOF-TEST")
+        if transport == "tcp":
+            return IP(src=src, dst=dst)/TCP(dport=port, flags="S")
+        return IP(src=src, dst=dst)/ICMP()
     total = net.num_addresses
     if total <= 2:
-        pkt = IP(src=str(net.network_address), dst=dst)/ICMP()
-        send(pkt, count=per, inter=0, verbose=False)
+        pkt = make_pkt(str(net.network_address))
+        send(pkt, count=per, inter=delay, verbose=False)
         print('RAW_SPOOF_BATCH_DONE scapy=1')
     else:
         usable = total - 2
@@ -1452,8 +1607,8 @@ try:
         done = 0
         for i in range(1, n + 1):
             src = str(ipaddress.ip_address(base + i))
-            pkt = IP(src=src, dst=dst)/ICMP()
-            send(pkt, count=per, inter=0, verbose=False)
+            pkt = make_pkt(src)
+            send(pkt, count=per, inter=delay, verbose=False)
             done += 1
             if done % 2000 == 0:
                 print('RAW_PROGRESS scapy %d/%d' % (done, n))
@@ -1465,10 +1620,10 @@ PYEOF
         echo -e "${CYAN}--- Phase 2b: RAW spoof via nping (rep-IP proof only in full-range mode) ---${NC}"
         rm -f "$nping_log"
         if command -v nping >/dev/null 2>&1; then
-            nping --icmp -c "$PKTS" --delay 200ms --source-ip "$rep" "$target" >> "$nping_log" 2>&1 || true
+            nping $([ "$TEST_TRANSPORT" = "udp" ] && echo "--udp -p $TEST_PORT" || ([ "$TEST_TRANSPORT" = "tcp" ] && echo "--tcp -p $TEST_PORT --flags syn" || echo "--icmp")) -c "$PKTS" --delay "${NPING_DELAY_MS}ms" --source-ip "$rep" "$target" >> "$nping_log" 2>&1 || true
             echo "RAW_SPOOF_SENT (nping src=$rep)"
             tail -30 "$nping_log"
-            check_nping_proof "$nping_log" "$spoof" || true
+            [ "$TEST_TRANSPORT" = "icmp" ] && check_nping_proof "$nping_log" "$spoof" || true
         else
             echo "(nping missing locally, skipping)"
         fi
@@ -1487,24 +1642,23 @@ direct_test() {
     local remote_rx_log="/tmp/foreign_rx_$$.log"
     rm -f "$remote_rx_log"
 
-    local remote_prefix=""
-    if [ "$FOREIGN_USER" != "root" ]; then
-        remote_prefix="echo '$FOREIGN_PASS' | sudo -S "
-    fi
+    local remote_prefix
+    remote_prefix="$(remote_prefix_cmd)"
 
     local _spoof_filter
     _spoof_filter="$(spoof_filter_expr)"
-    echo -e "${YELLOW}[*] Starting tcpdump on Foreign server (listening for ICMP)...${NC}"
-    echo -e "${BLUE}[*] Capture filter: icmp and ($_spoof_filter or src host $LOCAL_IP)${NC}"
+    local _transport_filter _remote_iface _capture_expr
+    _transport_filter="$(transport_bpf)"
+    _remote_iface="$(remote_capture_iface "$LOCAL_IP")"
+    _remote_iface="${_remote_iface:-any}"
+    _capture_expr="(icmp and src host $LOCAL_IP) or (($_transport_filter) and ($_spoof_filter))"
+    echo -e "${YELLOW}[*] Starting tcpdump on Foreign server...${NC}"
+    echo -e "${BLUE}[*] Capture interface: $_remote_iface${NC}"
+    echo -e "${BLUE}[*] Capture filter: $_capture_expr${NC}"
     local _cap_to
     _cap_to="$(capture_timeout_for_n "${CIDR_SAMPLE_MAX:-1}")"
     echo -e "${BLUE}[*] Capture window: ${_cap_to}s (auto-sized for ${CIDR_SAMPLE_MAX:-1} IP(s))${NC}"
-    sshpass -p "$FOREIGN_PASS" ssh -p "$FOREIGN_PORT" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        "$FOREIGN_USER@$FOREIGN_IP" \
-        "${remote_prefix}timeout ${_cap_to} tcpdump -n -l -i any 'icmp and ($_spoof_filter or src host $LOCAL_IP)'" > "$remote_rx_log" 2>&1 &
+    ssh_exec "${remote_prefix}timeout ${_cap_to} tcpdump -n -l -i '$_remote_iface' '$_capture_expr'" > "$remote_rx_log" 2>&1 &
     local remote_pid=$!
 
     if ! wait_for_tcpdump_ready "$remote_rx_log"; then
@@ -1674,12 +1828,18 @@ reverse_test() {
 
     local _spoof_filter
     _spoof_filter="$(spoof_filter_expr)"
-    echo -e "${YELLOW}[*] Starting local tcpdump on Iran server (listening for ICMP)...${NC}"
-    echo -e "${BLUE}[*] Capture filter: icmp and ($_spoof_filter or src host $FOREIGN_IP)${NC}"
+    local _transport_filter _local_iface _capture_expr
+    _transport_filter="$(transport_bpf)"
+    _local_iface="$(capture_iface_local "$FOREIGN_IP")"
+    _local_iface="${_local_iface:-any}"
+    _capture_expr="(icmp and src host $FOREIGN_IP) or (($_transport_filter) and ($_spoof_filter))"
+    echo -e "${YELLOW}[*] Starting local tcpdump on Iran server...${NC}"
+    echo -e "${BLUE}[*] Capture interface: $_local_iface${NC}"
+    echo -e "${BLUE}[*] Capture filter: $_capture_expr${NC}"
     local _cap_to
     _cap_to="$(capture_timeout_for_n "${CIDR_SAMPLE_MAX:-1}")"
     echo -e "${BLUE}[*] Capture window: ${_cap_to}s (auto-sized for ${CIDR_SAMPLE_MAX:-1} IP(s))${NC}"
-    timeout "$_cap_to" tcpdump -n -l -i any "icmp and ($_spoof_filter or src host $FOREIGN_IP)" > "$local_rx_log" 2>&1 &
+    timeout "$_cap_to" tcpdump -n -l -i "$_local_iface" "$_capture_expr" > "$local_rx_log" 2>&1 &
     local local_pid=$!
 
     if ! wait_for_tcpdump_ready "$local_rx_log"; then
@@ -1874,7 +2034,6 @@ print_summary() {
 }
 
 auto_test() {
-    check_sshpass || return 1
 
     echo
     echo "======================================"
@@ -1898,11 +2057,26 @@ auto_test() {
     FOREIGN_USER="${FOREIGN_USER:-root}"
     FOREIGN_USER="$(echo "$FOREIGN_USER" | tr -d '[:space:]')"
 
-    read -s -rp "Foreign SSH Password: " FOREIGN_PASS
     echo
-    if [ -z "$FOREIGN_PASS" ]; then
-        echo -e "${RED}[!] Password cannot be empty.${NC}"
-        return 1
+    echo "SSH authentication:"
+    echo "  1) SSH key / ssh-agent [recommended, default]"
+    echo "  2) Password via sshpass [fallback]"
+    read -rp "Select [1-2, default 1]: " _ssh_mode
+    case "${_ssh_mode:-1}" in
+        2) SSH_AUTH_MODE="password" ;;
+        *) SSH_AUTH_MODE="key" ;;
+    esac
+    FOREIGN_PASS=""
+    if [ "$SSH_AUTH_MODE" = "password" ]; then
+        check_sshpass || return 1
+        read -s -rp "Foreign SSH Password: " FOREIGN_PASS
+        echo
+        if [ -z "$FOREIGN_PASS" ]; then
+            echo -e "${RED}[!] Password cannot be empty in password mode.${NC}"
+            return 1
+        fi
+    else
+        echo -e "${BLUE}[*] Key mode uses your normal SSH key/agent and known_hosts verification.${NC}"
     fi
 
     local detected_local_ip
@@ -2048,6 +2222,8 @@ auto_test() {
     read -rp "Select [1-3, default 1]: " TEST_DIR
     TEST_DIR="${TEST_DIR:-1}"
 
+    configure_test_options
+
     echo
     read -rp "Enable DEBUG mode (full trace + diagnostics bundle to send for analysis)? [y/N]: " DBG_ASK
     case "$DBG_ASK" in
@@ -2073,6 +2249,12 @@ auto_test() {
         echo "Per-CIDR samples : $GLOBAL_CIDR_N"
     fi
     echo "Test Mode        : $([ "$TEST_DIR" -eq 1 ] && echo "Both (Direct + Reverse)" || ([ "$TEST_DIR" -eq 2 ] && echo "Direct Only" || echo "Reverse Only"))"
+    echo "RAW Transport    : $TEST_TRANSPORT"
+    [ "$TEST_TRANSPORT" != "icmp" ] && echo "Transport port   : $TEST_PORT"
+    echo "Probe delay      : ${PROBE_DELAY_SEC}s"
+    echo "Capture interface: $CAPTURE_INTERFACE"
+    echo "SSH auth         : $SSH_AUTH_MODE"
+    echo "TTL diagnostic   : $([ "$TTL_PATH_PROBE" -eq 1 ] && echo "enabled (max $TTL_MAX)" || echo "disabled")"
     echo "Output files     : ./spoof_summary.csv + ./spoof_full.csv (overwritten, appended per target)"
     echo "--------------------------------------"
     echo
@@ -2085,29 +2267,20 @@ auto_test() {
 
     echo
     echo -e "${BLUE}[*] Testing SSH connection to Foreign server...${NC}"
-    if ! sshpass -p "$FOREIGN_PASS" ssh -p "$FOREIGN_PORT" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        "$FOREIGN_USER@$FOREIGN_IP" "echo SSH_OK" >/dev/null 2>&1; then
-        echo -e "${RED}[!] SSH connection failed. Check IP, port, username, and password.${NC}"
+    if ! ssh_exec "echo SSH_OK" >/dev/null 2>&1; then
+        echo -e "${RED}[!] SSH connection failed. Check IP, port, username, and selected authentication mode.${NC}"
         return 1
     fi
     echo -e "${GREEN}[+] SSH connection successful.${NC}"
 
+    ttl_path_diagnostic_local "$FOREIGN_IP"
+
     echo -e "${BLUE}[*] Checking required tools on Foreign server...${NC}"
-    local remote_prefix=""
-    if [ "$FOREIGN_USER" != "root" ]; then
-        remote_prefix="echo '$FOREIGN_PASS' | sudo -S "
-    fi
+    local remote_prefix
+    remote_prefix="$(remote_prefix_cmd)"
 
     local missing_remote
-    missing_remote=$(sshpass -p "$FOREIGN_PASS" ssh -p "$FOREIGN_PORT" \
-        -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        "$FOREIGN_USER@$FOREIGN_IP" "
+    missing_remote=$(ssh_exec "
         for cmd in iptables tcpdump ping nft conntrack nping; do
             command -v \$cmd >/dev/null 2>&1 || echo \$cmd
         done
@@ -2116,11 +2289,7 @@ auto_test() {
     if [ -n "$missing_remote" ]; then
         echo -e "${YELLOW}[!] Missing tools on Foreign server: $missing_remote${NC}"
         echo -e "${YELLOW}[*] Attempting to install missing tools on Foreign server...${NC}"
-        sshpass -p "$FOREIGN_PASS" ssh -p "$FOREIGN_PORT" \
-            -o StrictHostKeyChecking=no \
-            -o UserKnownHostsFile=/dev/null \
-            -o LogLevel=ERROR \
-            "$FOREIGN_USER@$FOREIGN_IP" "
+        ssh_exec "
             if command -v apt-get >/dev/null 2>&1; then
                 ${remote_prefix}apt-get update -y && ${remote_prefix}apt-get install -y tcpdump iptables iputils-ping nftables conntrack nmap python3-scapy
             elif command -v yum >/dev/null 2>&1; then
